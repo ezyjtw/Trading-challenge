@@ -1,0 +1,23 @@
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+vendor/
+bin/
+.env
+.env.*
+
+# compiled binaries
+/market-data
+/funding-engine
+/arb-engine
+/execution-router
+/risk-daemon
+/challenge-daemon
+/capital-allocator
+/ledger

@@ -1,0 +1,37 @@
+challenge:
+  enabled: true
+  mode: "phase1"  # phase1 | phase2 | funded
+  initial_balance: 100000
+
+  # Daily drawdown (from highest equity that day, resets UTC midnight)
+  daily_drawdown_soft_pct: 3.0    # stop opening new positions
+  daily_drawdown_hard_pct: 4.0    # flatten optional positions
+  daily_drawdown_breach_pct: 5.0  # challenge failed
+
+  # Overall drawdown (from starting balance)
+  overall_drawdown_soft_pct: 7.0   # reduce position sizes by 50%
+  overall_drawdown_hard_pct: 8.5   # flatten everything except core funding
+  overall_drawdown_breach_pct: 10.0 # challenge failed
+
+  # Per-trade risk
+  max_risk_per_trade_pct: 3.0      # stop-loss distance * position size <= 3% of initial
+
+  # Profit distribution (phase1 & phase2 only)
+  profit_distribution_max_pct: 40.0 # no single trade > 40% of total profit
+
+  # Trading days
+  min_trading_days: 10             # phase1: 10, phase2: 5
+  safety_trade_time_utc: "22:00"   # open minimal position if no trades today
+  safety_trade_size_usd: 100
+
+  # Stop-loss
+  stop_loss_deadline_seconds: 300  # must place SL within 5 minutes
+  stop_loss_default_pct: 2.5      # emergency SL distance per leg
+
+  # Low-cap restrictions
+  low_cap_threshold_usd: 100000000
+  low_cap_max_allocation_pct: 5.0
+
+  # Funded account mode rules
+  funded_max_margin_exposure_pct: 25.0  # total margin <= 25% of initial
+  funded_max_notional_multiplier: 2.0   # total notional <= 2x balance

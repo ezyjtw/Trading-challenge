@@ -1,0 +1,140 @@
+version: "3.9"
+
+x-common-env: &common-env
+  REDIS_ADDR: "redis:6379"
+  BYBIT_API_KEY: "${BYBIT_API_KEY}"
+  BYBIT_API_SECRET: "${BYBIT_API_SECRET}"
+  BYBIT_TESTNET: "${BYBIT_TESTNET:-false}"
+  POSTGRES_URL: "postgres://trader:trader@postgres:5432/trading?sslmode=disable"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trader
+      POSTGRES_DB: trading
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  market-data:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: market-data
+    environment:
+      <<: *common-env
+      CONFIG_PATH: /app/configs/env.yaml
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  funding-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: funding-engine
+    environment:
+      <<: *common-env
+      CONFIG_PATH: /app/configs/env.yaml
+    depends_on:
+      - redis
+      - market-data
+    restart: unless-stopped
+
+  arb-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: arb-engine
+    environment:
+      <<: *common-env
+      CONFIG_PATH: /app/configs/env.yaml
+    depends_on:
+      - redis
+      - market-data
+    restart: unless-stopped
+
+  capital-allocator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: capital-allocator
+    environment:
+      <<: *common-env
+      CONFIG_PATH: /app/configs/env.yaml
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  challenge-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: challenge-daemon
+    environment:
+      <<: *common-env
+      CHALLENGE_CONFIG: /app/configs/challenge_config.yaml
+      CONFIG_PATH: /app/configs/env.yaml
+    depends_on:
+      - redis
+      - risk-daemon
+    restart: unless-stopped
+
+  execution-router:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: execution-router
+    environment:
+      <<: *common-env
+      CONFIG_PATH: /app/configs/env.yaml
+    depends_on:
+      - redis
+      - challenge-daemon
+    restart: unless-stopped
+
+  risk-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: risk-daemon
+    environment:
+      <<: *common-env
+      CONFIG_PATH: /app/configs/env.yaml
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  ledger:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: ledger
+    environment:
+      <<: *common-env
+      CONFIG_PATH: /app/configs/env.yaml
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+volumes:
+  pgdata:
