@@ -95,6 +95,20 @@ services:
       - risk-daemon
     restart: unless-stopped
 
+  strategy-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: strategy-engine
+    environment:
+      <<: *common-env
+      CONFIG_PATH: /app/configs/env.yaml
+    depends_on:
+      - redis
+      - market-data
+    restart: unless-stopped
+
   execution-router:
     build:
       context: .

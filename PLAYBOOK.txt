@@ -1,0 +1,518 @@
+# Prop Trading Challenge Playbook
+# From Zero to Funded Account — Step by Step
+#
+# Written for HyroTrader $100k Two-Step challenge.
+# Replicable for: FTMO, TopStep, The5ers, MyForexFunds, or any prop firm
+# with similar drawdown/profit-target rules on crypto.
+
+# ============================================================================
+# PHASE 0: PREREQUISITES (before spending any money)
+# ============================================================================
+
+## 0.1 — Accounts You Need
+
+1. Bybit account (KYC verified)
+   - Create at https://www.bybit.com
+   - Complete identity verification (takes 1-24 hours)
+   - Enable API access in account settings
+
+2. VPS / Server (for 24/7 uptime)
+   - Minimum: 2 vCPU, 4GB RAM, 50GB SSD
+   - Recommended providers: Hetzner (€4.50/mo), DigitalOcean ($12/mo), AWS Lightsail ($10/mo)
+   - Location: Singapore or Tokyo (closest to Bybit servers)
+   - Install: Docker, Docker Compose, Git
+
+3. HyroTrader account
+   - Sign up at https://hyrotrader.com
+   - DO NOT purchase the challenge yet (testnet first)
+
+4. Monitoring (optional but recommended)
+   - Discord webhook URL for alerts (free)
+   - Or Telegram bot token
+
+## 0.2 — Bybit API Keys
+
+Create TWO sets of API keys:
+
+  TESTNET keys (for validation):
+    - Go to https://testnet.bybit.com
+    - Create account, create API key
+    - Permissions: Read + Trade (NO withdrawal)
+    - IP whitelist: your VPS IP
+
+  MAINNET keys (for live trading):
+    - Go to https://www.bybit.com → API Management
+    - Create API key
+    - Permissions: Read + Trade (NO withdrawal)
+    - IP whitelist: your VPS IP
+    - DO NOT use these until Step 3
+
+## 0.3 — Clone and Configure
+
+  git clone <your-repo-url> ~/Trading-challenge
+  cd ~/Trading-challenge
+
+  # Create .env file (NEVER commit this)
+  cat > .env << 'ENVEOF'
+  BYBIT_API_KEY=your_testnet_key_here
+  BYBIT_API_SECRET=your_testnet_secret_here
+  BYBIT_TESTNET=true
+  ALERT_WEBHOOK_URL=your_discord_webhook_here
+  ENVEOF
+
+  chmod 600 .env
+
+# ============================================================================
+# PHASE 1: TESTNET VALIDATION (1-3 days)
+# ============================================================================
+#
+# Goal: Prove the system works end-to-end before risking real money.
+# You MUST complete every step here before proceeding.
+
+## Step 1.1 — Build and Start All Services
+
+  # Build everything
+  docker compose build
+
+  # Start infrastructure first
+  docker compose up -d redis postgres
+
+  # Wait 5 seconds, then start all services
+  docker compose up -d
+
+  # Check all services are running
+  docker compose ps
+
+  # Expected: all services show "Up" status
+  # If any service is restarting, check logs:
+  docker compose logs <service-name> --tail 50
+
+## Step 1.2 — Verify Market Data Flow
+
+  # Watch market data stream
+  docker compose logs market-data -f
+
+  # You should see within 30 seconds:
+  #   - WebSocket connected
+  #   - Ticker updates for BTCUSDT, ETHUSDT
+  #   - Funding rate polls completing
+
+  # Verify data reaches Redis
+  docker compose exec redis redis-cli XLEN market:data
+  # Should return a number > 0 and growing
+
+## Step 1.3 — Verify Strategy Engine Decisions
+
+  # Watch strategy engine logs
+  docker compose logs strategy-engine -f
+
+  # Within 2 minutes you should see:
+  #   - "strategy decision" log lines for each symbol
+  #   - Decisions showing FUNDING_CARRY, BASIS_REVERSION, or HOLD
+  #   - Regime classification (BULLISH/NEUTRAL/BEARISH)
+
+  # Key things to verify:
+  #   ✓ Basis tracker is recording samples (count increasing)
+  #   ✓ Regime detector is classifying correctly
+  #   ✓ Entry intents are being generated when conditions are met
+  #   ✓ No panic/crash loops
+
+## Step 1.4 — Verify Full Trade Cycle
+
+  # Watch execution router
+  docker compose logs execution-router -f
+
+  # Wait for a trade intent to flow through:
+  #   strategy-engine → trade:intents → challenge-daemon → trade:approved → execution-router
+
+  # On testnet, check Bybit testnet dashboard:
+  #   https://testnet.bybit.com → Positions
+  #   You should see:
+  #     - A spot BUY order filled
+  #     - A perp SELL order filled
+  #     - Delta-neutral position (long spot + short perp)
+
+  # In strategy-engine logs, confirm:
+  #   "strategy: position confirmed" — ConfirmEntry was called
+
+## Step 1.5 — Verify Exit Cycle
+
+  # If funding rate drops or goes negative on testnet, the engine should:
+  #   1. Generate an exit intent
+  #   2. Sell spot + buy perp (reverse of entry)
+  #   3. Log "strategy: position closed"
+
+  # To force-test exits: temporarily lower the funding threshold
+  # by setting env var FUNDING_EXIT_THRESHOLD_RATE=0.001 and restart
+
+## Step 1.6 — Verify Safety Trade
+
+  # The safety trade fires at 22:00 UTC if no trade happened that day.
+  # On testnet, verify by checking logs after 22:00 UTC:
+  docker compose logs challenge-daemon -f
+  # Should see safety trade intent generated
+
+## Step 1.7 — Run for 24+ Hours
+
+  # Let the system run for at least 24 hours on testnet.
+  # Check the next morning:
+
+  docker compose logs strategy-engine --since 24h | grep "strategy decision"
+  docker compose logs execution-router --since 24h | grep "executing intent"
+  docker compose logs challenge-daemon --since 24h | grep "trade recorded"
+
+  # Verify:
+  #   ✓ No crashes or restart loops (docker compose ps shows all "Up")
+  #   ✓ At least 1 trade per day (safety trade at minimum)
+  #   ✓ No drawdown breaches
+  #   ✓ Positions are delta-neutral (check Bybit testnet)
+
+## Step 1.8 — Testnet Acceptance Criteria
+
+  Before proceeding, ALL of the following must be true:
+
+  [ ] All 10+ services run stable for 24h+ with no restarts
+  [ ] Market data feeds are live (no stale data warnings)
+  [ ] Strategy engine generates correct decisions (funding/basis/hold)
+  [ ] At least one full entry+exit cycle completed successfully
+  [ ] ConfirmEntry/ConfirmExit feedback loop verified in logs
+  [ ] Safety trade fires correctly at 22:00 UTC
+  [ ] Drawdown tracking shows correct values
+  [ ] No hedge failures or emergency unwinds in logs
+  [ ] Redis streams are flowing (XLEN on each stream returns > 0)
+
+# ============================================================================
+# PHASE 2: PURCHASE AND START THE CHALLENGE (Day 1)
+# ============================================================================
+
+## Step 2.1 — Purchase the HyroTrader Challenge
+
+  - Go to https://hyrotrader.com
+  - Select: $100,000 Two-Step Challenge ($999)
+  - Complete payment
+  - You will receive Bybit API credentials (sub-account)
+  - These are DIFFERENT from your personal Bybit keys
+
+## Step 2.2 — Switch to Live Configuration
+
+  # Update .env with HyroTrader-provided credentials
+  cat > .env << 'ENVEOF'
+  BYBIT_API_KEY=hyrotrader_provided_key
+  BYBIT_API_SECRET=hyrotrader_provided_secret
+  BYBIT_TESTNET=false
+  ALERT_WEBHOOK_URL=your_discord_webhook_here
+  ENVEOF
+
+  chmod 600 .env
+
+  # Verify challenge config is set to phase1
+  # In configs/challenge_config.yaml:
+  #   mode: "phase1"
+  #   initial_balance: 100000
+
+## Step 2.3 — Rebuild and Deploy
+
+  # Stop all services
+  docker compose down
+
+  # Rebuild with production config
+  docker compose build
+
+  # Start infrastructure
+  docker compose up -d redis postgres
+
+  # Start services one by one (verify each)
+  docker compose up -d market-data
+  sleep 10 && docker compose logs market-data --tail 5
+
+  docker compose up -d risk-daemon
+  docker compose up -d challenge-daemon
+  docker compose up -d strategy-engine
+  docker compose up -d capital-allocator
+  docker compose up -d execution-router
+  docker compose up -d ledger
+
+  # Verify all running
+  docker compose ps
+
+## Step 2.4 — First-Hour Monitoring (CRITICAL)
+
+  # Watch ALL logs simultaneously in the first hour:
+  docker compose logs -f strategy-engine execution-router challenge-daemon
+
+  # Verify within first 30 minutes:
+  #   ✓ Market data is live (mainnet prices, not testnet)
+  #   ✓ Account equity reads as ~$100,000
+  #   ✓ Strategy decisions are being logged
+  #   ✓ No drawdown warnings
+  #   ✓ Risk mode is NORMAL (not HALTED)
+
+  # Check Bybit dashboard:
+  #   - Log into the HyroTrader sub-account on Bybit
+  #   - Verify balance shows ~$100,000
+  #   - No unexpected positions
+
+# ============================================================================
+# PHASE 3: PHASE 1 OPERATION (10-30+ days)
+# ============================================================================
+#
+# Target: $10,000 profit (10%) over minimum 10 trading days
+# Strategy: Patient, small, consistent gains. No rushing.
+#
+# Expected daily profit at 30% allocation with 0.01% avg funding rate:
+#   $100,000 × 30% × 0.01% × 3 cycles/day = $9/day from funding alone
+#   Plus basis reversion trades when opportunities arise
+#
+# At $9-30/day, the $10,000 target takes 30-100+ days.
+# That is fine. You have infinite time. Patience is the edge.
+
+## Step 3.1 — Daily Monitoring Routine
+
+  # Every morning (pick a consistent time):
+
+  # 1. Check service health
+  docker compose ps
+
+  # 2. Check for any warnings/errors overnight
+  docker compose logs --since 12h | grep -i "error\|warn\|halt\|breach\|failed"
+
+  # 3. Check strategy decisions
+  docker compose logs strategy-engine --since 12h | grep "strategy decision"
+
+  # 4. Check P&L
+  docker compose logs challenge-daemon --since 12h | grep "trade recorded"
+
+  # 5. Check trading day count
+  docker compose logs challenge-daemon --since 12h | grep "trading_days"
+
+  # 6. Log into Bybit and verify:
+  #    - Positions match what the engine thinks it has
+  #    - Equity is tracking correctly
+  #    - No orphaned positions
+
+## Step 3.2 — What to Expect
+
+  Week 1-2:
+    - System accumulates basis tracker data (first 30 minutes)
+    - Regime detector needs 3+ days of funding data for accuracy
+    - Expect mostly HOLD decisions initially (conservative by design)
+    - Safety trades count trading days even when HOLD
+    - Small funding carry trades when rates are favorable
+
+  Week 3+:
+    - Regime detector has enough data for accurate classification
+    - Basis tracker z-scores become meaningful
+    - More frequent funding carry entries on good days
+    - Occasional basis reversion trades on spread spikes
+
+  Typical day in positive funding environment:
+    07:00 UTC - Strategy evaluates, enters funding carry (BTC+ETH)
+    08:00 UTC - Funding payment collected (8h cycle)
+    16:00 UTC - Second funding payment collected
+    22:00 UTC - Safety trade check (already traded, skip)
+    00:00 UTC - Third funding payment collected
+    00:01 UTC - Daily reset, high-water mark updated
+
+  Typical day in negative funding environment:
+    07:00 UTC - Strategy evaluates, decides HOLD (negative rates)
+    Throughout day - Monitors for basis reversion opportunities
+    14:00 UTC - Basis z-score spikes to 2.5 → enters basis trade
+    15:30 UTC - Basis converges, z-score drops to 0.3 → exits
+    22:00 UTC - Safety trade if no trade yet today
+
+## Step 3.3 — When to Intervene
+
+  INTERVENE IMMEDIATELY if:
+    - Any service shows "Restarting" in docker compose ps
+    - Discord alert says "HEDGE FAILED"
+    - Discord alert mentions "BREACH" or "HALTED"
+    - Bybit shows positions that don't match engine state
+    - Equity drops more than 2% in a single day
+
+  HOW to intervene:
+    # 1. Stop the execution router (prevents new trades)
+    docker compose stop execution-router
+
+    # 2. Check what happened
+    docker compose logs execution-router --since 1h
+    docker compose logs strategy-engine --since 1h
+
+    # 3. Check Bybit positions manually
+    #    If there are orphaned positions, close them manually on Bybit
+
+    # 4. Fix the issue, restart
+    docker compose up -d execution-router
+
+  DO NOT INTERVENE for:
+    - HOLD decisions (this is correct behavior when no opportunity exists)
+    - Low daily profit (patience is the strategy)
+    - Funding rates going negative (the engine handles this)
+    - Basis z-score not triggering (thresholds are conservative by design)
+
+## Step 3.4 — Phase 1 Completion Criteria
+
+  Phase 1 is passed when ALL of these are true:
+
+  [ ] Account equity >= $110,000 (10% profit)
+  [ ] At least 10 distinct trading days with qualifying trades
+  [ ] No drawdown breach events
+  [ ] No rule violations flagged by HyroTrader
+
+  When these are met:
+    - HyroTrader will notify you (email)
+    - Phase 2 begins automatically or after you request it
+
+# ============================================================================
+# PHASE 4: PHASE 2 OPERATION (5-15+ days)
+# ============================================================================
+#
+# Target: $5,000 profit (5%) over minimum 5 trading days
+# Same drawdown rules. Same system. Just update the config.
+
+## Step 4.1 — Update Configuration
+
+  # Update configs/challenge_config.yaml:
+  #   mode: "phase2"
+  #   min_trading_days: 5
+  #   (initial_balance stays $100,000 — it resets for Phase 2)
+
+  # If HyroTrader provides new API keys for Phase 2, update .env
+
+  # Rebuild and restart
+  docker compose down && docker compose up -d
+
+## Step 4.2 — Phase 2 Strategy
+
+  Same as Phase 1. No changes needed.
+  The system will continue trading the same way.
+
+  Phase 2 is easier:
+    - Lower profit target (5% vs 10%)
+    - Fewer minimum trading days (5 vs 10)
+    - Same drawdown rules
+
+  Expected duration: 5-20 days
+
+## Step 4.3 — Phase 2 Completion
+
+  [ ] Account equity >= $105,000 (5% profit)
+  [ ] At least 5 distinct trading days
+  [ ] No drawdown breaches
+
+# ============================================================================
+# PHASE 5: FUNDED ACCOUNT OPERATION (ongoing)
+# ============================================================================
+
+## Step 5.1 — Switch to Funded Mode
+
+  # Update configs/challenge_config.yaml:
+  #   mode: "funded"
+  #   (new rules activate: 25% margin cap, 2x notional cap)
+  #   (profit distribution rule drops — no longer enforced)
+
+  # Update .env with funded account API keys from HyroTrader
+
+  docker compose down && docker compose up -d
+
+## Step 5.2 — Funded Account Rules
+
+  - Same 5% daily / 10% overall drawdown limits (PERMANENT)
+  - Max 25% of balance in margin across all positions
+  - Total notional cannot exceed 2x account balance
+  - Profit split: 70% you / 30% HyroTrader
+    (scales +5% every 4 months up to 90/10)
+  - Payouts in USDT/USDC, request anytime (12-24h processing)
+  - Account can scale up to $1,000,000
+
+## Step 5.3 — Ongoing Operation
+
+  The system runs autonomously. Your daily routine is:
+
+  1. Morning check (5 minutes):
+     - docker compose ps (all services up?)
+     - Check Discord for any alerts overnight
+     - Quick look at Bybit positions
+
+  2. Weekly review (30 minutes):
+     - Total P&L for the week
+     - Number of trades and trading days
+     - Regime distribution (how many days bullish vs bearish vs neutral)
+     - Any error patterns in logs
+     - Request payout if desired
+
+  3. Monthly review (1 hour):
+     - Overall P&L vs expectations
+     - Tune thresholds if needed (BasisEntryZScore, MinFundingAnnualPct)
+     - Update VPS/infrastructure if needed
+     - Check for Bybit API changes or fee schedule updates
+
+# ============================================================================
+# REPLICATION GUIDE: Adapting for Other Prop Firms
+# ============================================================================
+#
+# This system is designed to be portable. Here's how to adapt it.
+
+## For FTMO (Forex/Crypto)
+  # 1. Update challenge config:
+  #    daily_drawdown_breach_pct: 5.0
+  #    overall_drawdown_breach_pct: 10.0
+  #    profit target: 10% (Phase 1), 5% (Phase 2)
+  #    min_trading_days: 4
+  # 2. Same strategy works — FTMO allows crypto
+  # 3. Different exchange integration if not Bybit
+
+## For TopStep (Crypto)
+  # 1. Rules differ: trailing drawdown, no profit target (just consistency)
+  # 2. Update challenge config with their specific limits
+  # 3. Strategy engine works as-is
+
+## For any prop firm:
+  # 1. Read their rules document carefully
+  # 2. Update configs/challenge_config.yaml with their specific:
+  #    - Drawdown limits (daily and overall)
+  #    - Profit targets
+  #    - Minimum trading days
+  #    - Stop-loss requirements
+  #    - Position size limits
+  # 3. If they use a different exchange:
+  #    - Implement the exchange.Exchange interface for their exchange
+  #    - Update internal/exchange/<new-exchange>/
+  # 4. Deploy and follow the same testnet → live → funded pipeline
+
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+
+## Service won't start
+  docker compose logs <service> --tail 50
+  # Most common: Redis not ready yet. Restart the service.
+
+## No trades happening
+  # Check strategy engine decisions:
+  docker compose logs strategy-engine --since 1h | grep "strategy decision"
+  # If all HOLD: funding rates are too low and no basis opportunities.
+  # This is CORRECT behavior. Wait for better conditions.
+
+## Hedge failed alert
+  # 1. Stop execution router immediately
+  docker compose stop execution-router
+  # 2. Check Bybit for orphaned positions
+  # 3. Close any one-sided positions manually
+  # 4. Check logs for root cause
+  # 5. Restart when resolved
+
+## Drawdown warning
+  # Soft halt (3%): engine stops opening new positions automatically
+  # Hard halt (4%): engine flattens optional positions
+  # Breach (5%): CHALLENGE FAILED. Nothing to do but restart.
+  # The system handles all of this. If you get a breach alert,
+  # the challenge is over — don't trade further on that account.
+
+## Stale market data
+  docker compose restart market-data
+  # WebSocket reconnects automatically but sometimes needs a nudge
+
+## Redis full / OOM
+  docker compose exec redis redis-cli FLUSHALL
+  # Only do this if Redis is consuming too much memory
+  # The system will rebuild state from exchange on next cycle
