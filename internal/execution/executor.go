@@ -136,6 +136,17 @@ func (e *Executor) Execute(ctx context.Context, intent arb.TradeIntent) ([]Execu
 			qty = constraints.MinQty
 		}
 
+		// Validate MinNotional: ensure order value meets exchange minimum.
+		orderNotional := qty * mid
+		if constraints.MinNotional > 0 && orderNotional < constraints.MinNotional {
+			slog.Warn("order below MinNotional", "symbol", leg.Symbol,
+				"notional", orderNotional, "min", constraints.MinNotional)
+			if i > 0 && results[i-1].filled {
+				e.emergencyUnwind(ctx, intent, i-1, results[i-1], &allEvents)
+			}
+			break
+		}
+
 		// Retry with progressive widening: LIMIT at mid -> wider LIMIT -> IOC at worst.
 		var finalOrder *exchange.OrderResponse
 		var orderErr error

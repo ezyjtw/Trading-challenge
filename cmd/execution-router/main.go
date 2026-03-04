@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -73,7 +74,10 @@ func main() {
 	pollTicker := time.NewTicker(500 * time.Millisecond)
 	defer pollTicker.Stop()
 
-	executed, skipped := 0, 0
+	executed, skipped, deduped := 0, 0, 0
+
+	// Intent dedup: prevent executing the same intent twice (crash recovery).
+	var processedIntents sync.Map
 
 	for {
 		select {
@@ -118,6 +122,13 @@ func main() {
 					continue
 				}
 
+				// Idempotency: skip already-processed intents.
+				if _, loaded := processedIntents.LoadOrStore(intent.IntentID, true); loaded {
+					slog.Info("skipping duplicate intent", "id", intent.IntentID)
+					deduped++
+					continue
+				}
+
 				slog.Info("executing intent",
 					"id", intent.IntentID,
 					"strategy", intent.Strategy,
@@ -146,7 +157,7 @@ func main() {
 			}
 
 		case <-sig:
-			slog.Info("execution-router: shutting down", "executed", executed, "skipped", skipped)
+			slog.Info("execution-router: shutting down", "executed", executed, "skipped", skipped, "deduped", deduped)
 			cancel()
 			return
 		}
