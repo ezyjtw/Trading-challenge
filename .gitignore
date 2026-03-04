@@ -21,3 +21,4 @@ bin/
 /challenge-daemon
 /capital-allocator
 /ledger
+__pycache__/
