@@ -62,14 +62,15 @@ type RiskConfig struct {
 }
 
 // DefaultRiskConfig returns conservative defaults for a HyroTrader challenge.
+// SOP-aligned: 0.5% risk, 2R TP (Model A), max 3 concurrent.
 func DefaultRiskConfig() RiskConfig {
 	return RiskConfig{
-		MaxRiskPerTradePct:         1.5,  // 1.5% per trade (HyroTrader max is 3%)
+		MaxRiskPerTradePct:         0.5,  // SOP: fixed 0.5% per trade
 		DefaultLeverage:            10.0,
 		MaxLeverage:                20.0,
-		DefaultRR:                  1.5,  // 1.5R minimum for TP1
-		TP2Multiplier:              2.0,
-		TP3Multiplier:              3.0,
+		DefaultRR:                  2.0,  // SOP Model A: full TP at 2R, no partials
+		TP2Multiplier:              3.0,  // informational only — Model A uses TP1
+		TP3Multiplier:              4.0,  // informational only — Model A uses TP1
 		ATRMultiplierSL:            1.5,
 		MinSLDistancePct:           0.3,
 		MaxSLDistancePct:           2.0,
@@ -77,7 +78,7 @@ func DefaultRiskConfig() RiskConfig {
 		MinTradingDayTradeValuePct: 5.0,
 		MinTradingDayPnLPct:        1.0,
 		DailyMaxDrawdownPct:        4.0, // buffer below HyroTrader's 6%
-		MaxConcurrentTrades:        3,
+		MaxConcurrentTrades:        3,   // SOP: max 3 trades per day
 		CorrelationPenalty:         0.5,
 	}
 }

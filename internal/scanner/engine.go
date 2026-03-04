@@ -43,9 +43,11 @@ type EngineConfig struct {
 	TrendPullback  TrendPullbackConfig  `yaml:"trend_pullback"`
 	MultiTF        MultiTFConfig        `yaml:"multi_tf"`
 	Risk           RiskConfig           `yaml:"risk"`
+	Guardrail      GuardrailConfig      `yaml:"guardrail"`
 }
 
 // DefaultEngineConfig returns a full default configuration.
+// SOP-aligned: 15m TF, BTC+ETH+SOL, 0.5% risk, 2R TP, 3 trades/day max.
 func DefaultEngineConfig() EngineConfig {
 	return EngineConfig{
 		MinConfluence:        3,
@@ -63,6 +65,7 @@ func DefaultEngineConfig() EngineConfig {
 		TrendPullback:        DefaultTrendPullbackConfig(),
 		MultiTF:              DefaultMultiTFConfig(),
 		Risk:                 DefaultRiskConfig(),
+		Guardrail:            DefaultGuardrailConfig(),
 	}
 }
 
@@ -78,6 +81,7 @@ type Engine struct {
 	detectors []Detector
 	riskMgr   *RiskManager
 	tracker   *OutcomeTracker
+	guard     *Guardrails
 
 	// Market state per symbol.
 	states map[string]*MarketState
@@ -103,6 +107,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 		cfg:            cfg,
 		riskMgr:        NewRiskManager(cfg.Risk),
 		tracker:        NewOutcomeTracker("trade_history.json", 500),
+		guard:          NewGuardrails(cfg.Guardrail),
 		states:         make(map[string]*MarketState),
 		lastAlert:      make(map[string]int64),
 		accountBalance: cfg.InitialBalance,
@@ -206,6 +211,19 @@ func (e *Engine) Scan() []SignalAlert {
 	now := time.Now().UnixMilli()
 	var alerts []SignalAlert
 
+	// Check guardrails first — if daily limits are hit, skip entire scan.
+	dailyState := e.guard.DailyStatus()
+	if !dailyState.CanTrade {
+		log.Printf("scanner: guardrails blocked scan — %s", dailyState.Reason)
+		return nil
+	}
+
+	// Check time-stops on open trades.
+	expired := e.guard.CheckTimeStops()
+	for _, alertID := range expired {
+		log.Printf("scanner: time-stop triggered for %s", alertID)
+	}
+
 	for _, symbol := range e.cfg.Symbols {
 		state, ok := e.states[symbol]
 		if !ok || state.Price == 0 {
@@ -250,8 +268,9 @@ func (e *Engine) Scan() []SignalAlert {
 		}
 	}
 
-	// Notify callbacks.
+	// Register alerts with guardrails (starts cooldown timer) and notify callbacks.
 	for _, alert := range alerts {
+		e.guard.RegisterAlertReceived(alert.ID)
 		for _, cb := range e.callbacks {
 			cb(alert)
 		}
@@ -426,6 +445,11 @@ func (e *Engine) Tracker() *OutcomeTracker {
 // RiskManager returns the risk manager.
 func (e *Engine) RiskManager() *RiskManager {
 	return e.riskMgr
+}
+
+// Guardrails returns the guardrail enforcer.
+func (e *Engine) Guardrails() *Guardrails {
+	return e.guard
 }
 
 // AlertToJSON serializes an alert for transmission (e.g. Telegram, Discord).
