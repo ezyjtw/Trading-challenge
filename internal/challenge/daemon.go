@@ -540,6 +540,92 @@ func (d *Daemon) Reset() {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Public: paired stop-loss coordination
+// ---------------------------------------------------------------------------
+
+// PairedStopLossInfo describes the required stop-loss parameters for a
+// two-leg delta-neutral position, ensuring both legs have matching and
+// wide-enough stops.
+type PairedStopLossInfo struct {
+	SpotSymbol    string
+	PerpSymbol    string
+	MinWidthPct   decimal.Decimal // minimum stop distance as % of entry
+	SpotStopPrice decimal.Decimal // suggested spot stop price
+	PerpStopPrice decimal.Decimal // suggested perp stop price
+	Coordinated   bool            // true if both legs are tracked
+}
+
+// ComputePairedStopLoss calculates coordinated stop-loss levels for a
+// delta-neutral pair. Both legs get the same width (the configured default)
+// to prevent one leg from triggering without the other.
+func (d *Daemon) ComputePairedStopLoss(symbol string, spotEntry, perpEntry decimal.Decimal) PairedStopLossInfo {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	width := d.cfg.StopLossDefaultPct.Div(hundred)
+
+	// For long spot: stop below entry. For short perp: stop above entry.
+	spotStop := spotEntry.Mul(decimal.NewFromInt(1).Sub(width))
+	perpStop := perpEntry.Mul(decimal.NewFromInt(1).Add(width))
+
+	return PairedStopLossInfo{
+		SpotSymbol:    symbol,
+		PerpSymbol:    symbol,
+		MinWidthPct:   d.cfg.StopLossDefaultPct,
+		SpotStopPrice: spotStop,
+		PerpStopPrice: perpStop,
+		Coordinated:   true,
+	}
+}
+
+// ValidateStopLossWidth rejects a stop-loss that is too tight for the
+// position. Returns an error if the stop is closer than StopLossDefaultPct
+// to the entry price.
+func (d *Daemon) ValidateStopLossWidth(entryPrice, stopPrice decimal.Decimal) error {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if entryPrice.IsZero() {
+		return nil
+	}
+
+	distance := entryPrice.Sub(stopPrice).Abs()
+	widthPct := distance.Div(entryPrice).Mul(hundred)
+	minWidth := d.cfg.StopLossDefaultPct
+
+	if widthPct.LessThan(minWidth) {
+		return fmt.Errorf(
+			"stop-loss too tight: %.2f%% from entry, minimum %.2f%%",
+			widthPct.InexactFloat64(), minWidth.InexactFloat64(),
+		)
+	}
+	return nil
+}
+
+// ConfirmPairedStopLoss marks both the spot and perp legs as having
+// coordinated stop-losses. This should be called after both stops are
+// successfully placed on the exchange.
+func (d *Daemon) ConfirmPairedStopLoss(spotSymbol, perpSymbol string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if pos, ok := d.positions[spotSymbol]; ok {
+		pos.HasStopLoss = true
+		pos.StopLossSet = time.Now().UTC()
+	}
+	if perpSymbol != spotSymbol {
+		if pos, ok := d.positions[perpSymbol]; ok {
+			pos.HasStopLoss = true
+			pos.StopLossSet = time.Now().UTC()
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
 // halt transitions the daemon into a halted state. Must be called with d.mu held.
 func (d *Daemon) halt(reason string) {
 	d.halted = true

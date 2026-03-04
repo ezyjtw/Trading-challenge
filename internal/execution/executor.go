@@ -353,6 +353,7 @@ func (e *Executor) pollOrderStatus(ctx context.Context, cat exchange.Category, s
 }
 
 // emergencyUnwind reverses a filled leg with a market order.
+// Retries up to 3 times with exponential backoff if the unwind fails.
 func (e *Executor) emergencyUnwind(ctx context.Context, intent arb.TradeIntent, legIdx int, result legResult, events *[]ExecutionEvent) {
 	slog.Warn("EMERGENCY UNWIND", "intent", intent.IntentID, "leg", legIdx, "qty", result.filledQty)
 
@@ -361,45 +362,60 @@ func (e *Executor) emergencyUnwind(ctx context.Context, intent arb.TradeIntent, 
 		reverseAction = exchange.SideBuy
 	}
 
-	req := exchange.OrderRequest{
-		Category:      result.category,
-		Symbol:        result.symbol,
-		Side:          reverseAction,
-		Type:          exchange.OrderTypeMarket,
-		Quantity:      result.filledQty,
-		ReduceOnly:    true,
-		ClientOrderID: fmt.Sprintf("%s-unwind-l%d", intent.IntentID, legIdx),
-	}
+	const maxRetries = 3
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+			slog.Warn("emergency unwind retry", "attempt", attempt, "backoff", backoff)
+			time.Sleep(backoff)
+		}
 
-	resp, err := e.client.PlaceOrder(ctx, req)
-	if err != nil {
-		slog.Error("EMERGENCY UNWIND FAILED", "err", err)
+		req := exchange.OrderRequest{
+			Category:      result.category,
+			Symbol:        result.symbol,
+			Side:          reverseAction,
+			Type:          exchange.OrderTypeMarket,
+			Quantity:      result.filledQty,
+			ReduceOnly:    true,
+			ClientOrderID: fmt.Sprintf("%s-unwind-l%d-r%d", intent.IntentID, legIdx, attempt),
+		}
+
+		resp, err := e.client.PlaceOrder(ctx, req)
+		if err != nil {
+			slog.Error("emergency unwind attempt failed", "attempt", attempt, "err", err)
+			if attempt == maxRetries {
+				*events = append(*events, ExecutionEvent{
+					EventType: EventHedgeFailed,
+					IntentID:  intent.IntentID,
+					LegIndex:  legIdx,
+					Symbol:    result.symbol,
+					Strategy:  intent.Strategy,
+					TsMs:      time.Now().UnixMilli(),
+				})
+			}
+			continue
+		}
+
+		final := e.pollOrderStatus(ctx, result.category, result.symbol, resp.OrderID)
+		evtType := EventOrderFilled
+		if final == nil || final.Status != exchange.OrderStatusFilled {
+			evtType = EventHedgeFailed
+			if attempt < maxRetries {
+				continue
+			}
+		}
+
 		*events = append(*events, ExecutionEvent{
-			EventType: EventHedgeFailed,
+			EventType: evtType,
 			IntentID:  intent.IntentID,
 			LegIndex:  legIdx,
 			Symbol:    result.symbol,
+			Action:    string(reverseAction),
 			Strategy:  intent.Strategy,
 			TsMs:      time.Now().UnixMilli(),
 		})
 		return
 	}
-
-	final := e.pollOrderStatus(ctx, result.category, result.symbol, resp.OrderID)
-	evtType := EventOrderFilled
-	if final == nil || final.Status != exchange.OrderStatusFilled {
-		evtType = EventHedgeFailed
-	}
-
-	*events = append(*events, ExecutionEvent{
-		EventType: evtType,
-		IntentID:  intent.IntentID,
-		LegIndex:  legIdx,
-		Symbol:    result.symbol,
-		Action:    string(reverseAction),
-		Strategy:  intent.Strategy,
-		TsMs:      time.Now().UnixMilli(),
-	})
 }
 
 // reconcileFills verifies that the exchange state matches expectations
