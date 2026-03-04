@@ -9,25 +9,27 @@ import (
 
 func makeIntent(notionalUSD, expectedPnL float64) arb.TradeIntent {
 	return arb.TradeIntent{
-		IntentID:  "test-intent-1",
-		Strategy:  "funding",
-		Symbol:    "BTCUSDT",
-		TsMs:      1700000000000,
-		ExpiresMs: 1700000060000,
+		IntentID:    "test-intent-1",
+		Strategy:    "funding",
+		Symbol:      "BTCUSDT",
+		HedgeSymbol: "ETHUSDT",
+		HedgeBeta:   1.0,
+		TsMs:        1700000000000,
+		ExpiresMs:   1700000060000,
 		Legs: []arb.TradeLeg{
-			{
-				Action:         "BUY",
-				Type:           "LIMIT",
-				Market:         "SPOT",
-				Symbol:         "BTCUSDT",
-				NotionalUSD:    notionalUSD,
-				MaxSlippageBps: 5.0,
-			},
 			{
 				Action:         "SELL",
 				Type:           "LIMIT",
 				Market:         "PERP",
 				Symbol:         "BTCUSDT",
+				NotionalUSD:    notionalUSD,
+				MaxSlippageBps: 5.0,
+			},
+			{
+				Action:         "BUY",
+				Type:           "LIMIT",
+				Market:         "PERP",
+				Symbol:         "ETHUSDT",
 				NotionalUSD:    notionalUSD,
 				MaxSlippageBps: 5.0,
 			},

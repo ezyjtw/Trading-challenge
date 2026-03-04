@@ -1,4 +1,4 @@
-// Arb engine service: intra-Bybit basis trading (spot-perp spread capture).
+// Arb engine service: cross-pair spread trading (log price ratio mean-reversion).
 package main
 
 import (
@@ -39,14 +39,16 @@ func main() {
 	}
 
 	cfg := arb.BasisConfig{
-		Symbols:                []string{"BTCUSDT", "ETHUSDT"},
-		EntryStdDev:            2.0,
-		ExitStdDev:             0.5,
-		MinAnnualizedBasisPct:  15.0,
-		MaxHoldDays:            7,
-		MaxAllocationPct:       25.0,
-		MaxSlippageBps:         5.0,
-		CooldownS:              600,
+		Pairs: []arb.SpreadPairConfig{
+			{Primary: "BTCUSDT", Hedge: "ETHUSDT", MinCorrelation: 0.70},
+		},
+		EntryStdDev:           2.0,
+		ExitStdDev:            0.5,
+		MinAnnualizedBasisPct: 15.0,
+		MaxHoldDays:           7,
+		MaxAllocationPct:      25.0,
+		MaxSlippageBps:        5.0,
+		CooldownS:             600,
 	}
 
 	engine := arb.NewEngine(cfg)
@@ -56,6 +58,9 @@ func main() {
 
 	evalTicker := time.NewTicker(30 * time.Second)
 	defer evalTicker.Stop()
+
+	// Track latest quotes per symbol for cross-pair updates.
+	latestPrices := make(map[string]float64) // symbol -> mark price
 
 	for {
 		select {
@@ -70,7 +75,16 @@ func main() {
 				if err := json.Unmarshal(raw, &q); err != nil {
 					continue
 				}
-				engine.UpdatePrices(q.Symbol, q.LastPrice, q.MarkPrice, q.TsMs)
+				latestPrices[q.Symbol] = q.MarkPrice
+			}
+
+			// Update prices for each configured pair.
+			for _, pair := range cfg.Pairs {
+				pp, pOk := latestPrices[pair.Primary]
+				hp, hOk := latestPrices[pair.Hedge]
+				if pOk && hOk {
+					engine.UpdatePrices(pair.Primary, pair.Hedge, pp, hp, time.Now().UnixMilli())
+				}
 			}
 
 			intents := engine.Evaluate(100000) // TODO: get real equity from Redis
@@ -80,7 +94,8 @@ func main() {
 				}
 				slog.Info("basis intent emitted",
 					"id", intent.IntentID,
-					"symbol", intent.Symbol)
+					"symbol", intent.Symbol,
+					"hedge", intent.HedgeSymbol)
 			}
 
 		case <-sig:

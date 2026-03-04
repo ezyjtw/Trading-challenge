@@ -96,10 +96,8 @@ func (e *Executor) Execute(ctx context.Context, intent arb.TradeIntent) ([]Execu
 			}
 		}
 
+		// All legs are USDT perpetual futures (HyroTrader only allows PERP).
 		category := exchange.CategoryLinear
-		if leg.Market == "SPOT" {
-			category = exchange.CategorySpot
-		}
 
 		constraints, _ := e.client.GetConstraints(ctx, category, leg.Symbol)
 		if constraints == nil {
@@ -125,10 +123,16 @@ func (e *Executor) Execute(ctx context.Context, intent arb.TradeIntent) ([]Execu
 		mid := price.InexactFloat64()
 
 		// Partial fill adjustment: if leg A was partially filled, adjust leg B
-		// notional to match so the position stays delta-neutral.
+		// notional to maintain delta neutrality via beta weighting.
 		targetNotional := leg.NotionalUSD
 		if i > 0 && results[i-1].partial {
-			targetNotional = results[i-1].filledUSD.InexactFloat64()
+			actualPrimaryNotional := results[i-1].filledUSD.InexactFloat64()
+			if intent.HedgeBeta > 0 && leg.Symbol != intent.Symbol {
+				// Hedge leg: scale by beta to stay delta-neutral.
+				targetNotional = actualPrimaryNotional / intent.HedgeBeta
+			} else {
+				targetNotional = actualPrimaryNotional
+			}
 		}
 
 		qty := constraints.RoundQty(targetNotional / mid)
@@ -321,11 +325,12 @@ func (e *Executor) Execute(ctx context.Context, intent arb.TradeIntent) ([]Execu
 	}
 
 	fill := &FillSummary{
-		IntentID:  intent.IntentID,
-		Strategy:  intent.Strategy,
-		Symbol:    intent.Symbol,
-		TotalFees: totalFees.InexactFloat64(),
-		TsMs:      time.Now().UnixMilli(),
+		IntentID:    intent.IntentID,
+		Strategy:    intent.Strategy,
+		Symbol:      intent.Symbol,
+		HedgeSymbol: intent.HedgeSymbol,
+		TotalFees:   totalFees.InexactFloat64(),
+		TsMs:        time.Now().UnixMilli(),
 	}
 	if len(results) >= 2 && results[0].filled && results[1].filled {
 		fill.BuyPrice = results[0].fillPrice.InexactFloat64()

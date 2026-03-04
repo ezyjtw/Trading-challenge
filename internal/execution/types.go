@@ -38,12 +38,13 @@ type ExecutionEvent struct {
 
 // FillSummary aggregates a completed two-leg trade.
 type FillSummary struct {
-	IntentID  string  `json:"intent_id"`
-	Strategy  string  `json:"strategy"`
-	Symbol    string  `json:"symbol"`
-	BuyPrice  float64 `json:"buy_price"`
-	SellPrice float64 `json:"sell_price"`
-	TotalFees float64 `json:"total_fees"`
-	NetPnL    float64 `json:"net_pnl"`
-	TsMs      int64   `json:"ts_ms"`
+	IntentID    string  `json:"intent_id"`
+	Strategy    string  `json:"strategy"`
+	Symbol      string  `json:"symbol"`       // primary symbol
+	HedgeSymbol string  `json:"hedge_symbol"` // hedge symbol (cross-pair)
+	BuyPrice    float64 `json:"buy_price"`
+	SellPrice   float64 `json:"sell_price"`
+	TotalFees   float64 `json:"total_fees"`
+	NetPnL      float64 `json:"net_pnl"`
+	TsMs        int64   `json:"ts_ms"`
 }

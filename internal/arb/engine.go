@@ -7,9 +7,9 @@ import (
 	"time"
 )
 
-// spreadSample records a single spread observation for rolling statistics.
+// spreadSample records a single cross-pair spread observation.
 type spreadSample struct {
-	spread float64
+	spread float64 // log(primaryPrice / hedgePrice)
 	tsMs   int64
 }
 
@@ -20,43 +20,49 @@ type rollingStats struct {
 	count  int
 }
 
-// basisPosition tracks an open basis trade.
+// basisPosition tracks an open cross-pair spread trade.
 type basisPosition struct {
-	Symbol      string
-	NotionalUSD float64
-	EntrySpread float64
-	EntryTime   int64 // unix ms
-	EntryMean   float64
-	EntryStdDev float64
+	PairID        string
+	PrimarySymbol string
+	HedgeSymbol   string
+	NotionalUSD   float64 // primary leg notional
+	HedgeBeta     float64
+	EntrySpread   float64
+	EntryTime     int64 // unix ms
+	EntryMean     float64
+	EntryStdDev   float64
 }
 
-// symbolState holds per-symbol state for the basis engine.
-type symbolState struct {
-	spotPrice  float64
-	perpPrice  float64
-	lastTsMs   int64
-	samples    []spreadSample
-	position   *basisPosition
-	cooldownMs int64 // unix ms when cooldown expires
+// pairState holds per-pair state for the cross-pair spread engine.
+type pairState struct {
+	primaryPrice float64
+	hedgePrice   float64
+	lastTsMs     int64
+	samples      []spreadSample
+	position     *basisPosition
+	cooldownMs   int64   // unix ms when cooldown expires
+	beta         float64 // current beta estimate
 }
 
-// Engine is the intra-Bybit basis trading engine.
-// Strategy: spot-perp spread capture on the same exchange.
-// Entry when spread > 2 stddev from 24h mean AND annualized basis > 15%.
+// Engine is the cross-pair spread trading engine.
+// Strategy: trade the log price ratio between correlated perps.
+// Entry when spread > 2 stddev from 24h mean.
 // Exit when spread returns within 0.5 stddev, or time-based (> 7 days).
 type Engine struct {
 	mu    sync.Mutex
 	cfg   BasisConfig
-	state map[string]*symbolState
+	state map[string]*pairState // pairID -> state
 	seqID int
 }
 
-// NewEngine creates a new basis trading engine with the given config.
+// NewEngine creates a new cross-pair spread trading engine.
 func NewEngine(cfg BasisConfig) *Engine {
-	state := make(map[string]*symbolState, len(cfg.Symbols))
-	for _, sym := range cfg.Symbols {
-		state[sym] = &symbolState{
-			samples: make([]spreadSample, 0, 10800), // ~24h at 8s intervals
+	state := make(map[string]*pairState, len(cfg.Pairs))
+	for _, pair := range cfg.Pairs {
+		pid := pair.Primary + ":" + pair.Hedge
+		state[pid] = &pairState{
+			samples: make([]spreadSample, 0, 10800),
+			beta:    1.0,
 		}
 	}
 	return &Engine{
@@ -65,45 +71,55 @@ func NewEngine(cfg BasisConfig) *Engine {
 	}
 }
 
-// UpdatePrices ingests new spot and perp prices for a symbol and records
-// the spread sample for rolling statistics.
-func (e *Engine) UpdatePrices(symbol string, spotPrice, perpPrice float64, tsMs int64) {
+// UpdatePrices ingests new perp prices for both assets in a pair and records
+// the log price ratio for rolling statistics.
+func (e *Engine) UpdatePrices(primary, hedge string, primaryPrice, hedgePrice float64, tsMs int64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	ss, ok := e.state[symbol]
+	pid := primary + ":" + hedge
+	ps, ok := e.state[pid]
 	if !ok {
-		ss = &symbolState{
+		ps = &pairState{
 			samples: make([]spreadSample, 0, 10800),
+			beta:    1.0,
 		}
-		e.state[symbol] = ss
+		e.state[pid] = ps
 	}
 
-	ss.spotPrice = spotPrice
-	ss.perpPrice = perpPrice
-	ss.lastTsMs = tsMs
+	ps.primaryPrice = primaryPrice
+	ps.hedgePrice = hedgePrice
+	ps.lastTsMs = tsMs
 
-	// Calculate spread: (perp - spot) / spot.
-	if spotPrice > 0 {
-		spread := (perpPrice - spotPrice) / spotPrice
-		ss.samples = append(ss.samples, spreadSample{
+	if primaryPrice > 0 && hedgePrice > 0 {
+		spread := math.Log(primaryPrice / hedgePrice)
+		ps.samples = append(ps.samples, spreadSample{
 			spread: spread,
 			tsMs:   tsMs,
 		})
-		// Prune samples older than 25h to keep memory bounded.
+		// Prune samples older than 25h.
 		cutoff := tsMs - 25*60*60*1000
 		pruneIdx := 0
-		for pruneIdx < len(ss.samples) && ss.samples[pruneIdx].tsMs < cutoff {
+		for pruneIdx < len(ps.samples) && ps.samples[pruneIdx].tsMs < cutoff {
 			pruneIdx++
 		}
 		if pruneIdx > 0 {
-			ss.samples = ss.samples[pruneIdx:]
+			ps.samples = ps.samples[pruneIdx:]
 		}
 	}
 }
 
-// Evaluate checks all symbols for basis entry and exit opportunities
-// and returns TradeIntents.
+// UpdateBeta updates the current beta estimate for a pair.
+func (e *Engine) UpdateBeta(primary, hedge string, beta float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	pid := primary + ":" + hedge
+	if ps, ok := e.state[pid]; ok {
+		ps.beta = beta
+	}
+}
+
+// Evaluate checks all pairs for spread entry and exit opportunities.
 func (e *Engine) Evaluate(accountEquity float64) []TradeIntent {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -111,96 +127,107 @@ func (e *Engine) Evaluate(accountEquity float64) []TradeIntent {
 	now := time.Now().UnixMilli()
 	var intents []TradeIntent
 
-	for _, sym := range e.cfg.Symbols {
-		ss, ok := e.state[sym]
-		if !ok || ss.spotPrice <= 0 || ss.perpPrice <= 0 {
+	for _, pair := range e.cfg.Pairs {
+		pid := pair.Primary + ":" + pair.Hedge
+		ps, ok := e.state[pid]
+		if !ok || ps.primaryPrice <= 0 || ps.hedgePrice <= 0 {
 			continue
 		}
 
-		currentSpread := (ss.perpPrice - ss.spotPrice) / ss.spotPrice
+		currentSpread := math.Log(ps.primaryPrice / ps.hedgePrice)
 
-		// Compute rolling stats over 1h, 4h, 24h windows.
-		stats1h := computeRollingStats(ss.samples, now, 1*60*60*1000)
-		stats4h := computeRollingStats(ss.samples, now, 4*60*60*1000)
-		stats24h := computeRollingStats(ss.samples, now, 24*60*60*1000)
+		stats1h := computeRollingStats(ps.samples, now, 1*60*60*1000)
+		stats4h := computeRollingStats(ps.samples, now, 4*60*60*1000)
+		stats24h := computeRollingStats(ps.samples, now, 24*60*60*1000)
 
-		// Check for exit conditions first (if we have a position).
-		if ss.position != nil {
-			exitIntents := e.evaluateExit(sym, ss, currentSpread, stats24h, now)
+		// Check exit conditions first.
+		if ps.position != nil {
+			exitIntents := e.evaluateExit(ps, currentSpread, stats24h, now)
 			intents = append(intents, exitIntents...)
-			continue // don't evaluate entry while in position
+			continue
 		}
 
-		// Entry evaluation requires sufficient data.
 		if stats24h.count < 100 || stats24h.stddev <= 0 {
 			continue
 		}
 
-		// Skip if on cooldown.
-		if now < ss.cooldownMs {
+		if now < ps.cooldownMs {
 			continue
 		}
 
-		// Entry condition 1: spread > 2 stddev from 24h mean.
+		// Entry: spread > 2 stddev from 24h mean (either direction).
 		deviation := (currentSpread - stats24h.mean) / stats24h.stddev
-		if deviation < e.cfg.EntryStdDev {
+		absDeviation := math.Abs(deviation)
+		if absDeviation < e.cfg.EntryStdDev {
 			continue
 		}
 
-		// Entry condition 2: annualized basis > 15%.
-		// Annualized basis = spread * (365 / holdDays) * 100.
-		// For a conservative estimate, use the current spread annualized over 7 days.
-		annualizedBasisPct := math.Abs(currentSpread) * (365.0 / float64(e.cfg.MaxHoldDays)) * 100.0
+		annualizedBasisPct := math.Abs(currentSpread-stats24h.mean) * (365.0 / float64(e.cfg.MaxHoldDays)) * 100.0
 		if annualizedBasisPct < e.cfg.MinAnnualizedBasisPct {
 			continue
 		}
 
-		// Position sizing: max allocation percentage of account.
-		notional := accountEquity * (e.cfg.MaxAllocationPct / 100.0)
-		if notional < 10.0 {
+		primaryNotional := accountEquity * (e.cfg.MaxAllocationPct / 100.0)
+		if primaryNotional < 10.0 {
 			continue
 		}
 
-		// Estimate fees for both legs (entry + exit = 4 legs total, but intent is just entry).
-		feesEst := notional * 2.0 * (e.cfg.FeeBpsTaker / 10000.0)
-		slippageEst := notional * 2.0 * (e.cfg.MaxSlippageBps / 10000.0)
+		beta := ps.beta
+		if beta <= 0 {
+			beta = 1.0
+		}
+		hedgeNotional := primaryNotional / beta
 
-		edgeBpsGross := currentSpread * 10000.0
-		totalCostBps := (feesEst + slippageEst) / notional * 10000.0
+		totalNotional := primaryNotional + hedgeNotional
+		feesEst := totalNotional * (e.cfg.FeeBpsTaker / 10000.0)
+		slippageEst := totalNotional * (e.cfg.MaxSlippageBps / 10000.0)
+
+		edgeBpsGross := absDeviation * stats24h.stddev * 10000.0
+		totalCostBps := (feesEst + slippageEst) / primaryNotional * 10000.0
 		edgeBpsNet := edgeBpsGross - totalCostBps
 
-		e.seqID++
-		intentID := fmt.Sprintf("basis-%s-%d-%d", sym, now, e.seqID)
+		// Direction: if spread is above mean (positive z), sell primary + buy hedge.
+		// If spread is below mean (negative z), buy primary + sell hedge.
+		primaryAction := "SELL"
+		hedgeAction := "BUY"
+		if deviation < 0 {
+			primaryAction = "BUY"
+			hedgeAction = "SELL"
+		}
 
-		// Perp at premium: BUY SPOT + SELL PERP to capture convergence.
+		e.seqID++
+		intentID := fmt.Sprintf("basis-%s-%d-%d", pid, now, e.seqID)
+
 		intent := TradeIntent{
-			IntentID:  intentID,
-			Strategy:  "basis",
-			Symbol:    sym,
-			TsMs:      now,
-			ExpiresMs: now + e.cfg.IntentTTLMs,
+			IntentID:    intentID,
+			Strategy:    "basis",
+			Symbol:      pair.Primary,
+			HedgeSymbol: pair.Hedge,
+			HedgeBeta:   beta,
+			TsMs:        now,
+			ExpiresMs:   now + e.cfg.IntentTTLMs,
 			Legs: []TradeLeg{
 				{
-					Action:         "BUY",
+					Action:         primaryAction,
 					Type:           "LIMIT",
-					Market:         "SPOT",
-					Symbol:         sym,
-					NotionalUSD:    notional,
+					Market:         "PERP",
+					Symbol:         pair.Primary,
+					NotionalUSD:    primaryNotional,
 					MaxSlippageBps: e.cfg.MaxSlippageBps,
 				},
 				{
-					Action:         "SELL",
+					Action:         hedgeAction,
 					Type:           "LIMIT",
 					Market:         "PERP",
-					Symbol:         sym,
-					NotionalUSD:    notional,
+					Symbol:         pair.Hedge,
+					NotionalUSD:    hedgeNotional,
 					MaxSlippageBps: e.cfg.MaxSlippageBps,
 				},
 			},
 			Expected: ExpectedMetrics{
 				EdgeBpsGross:      edgeBpsGross,
 				EdgeBpsNet:        edgeBpsNet,
-				ProfitUSDNet:      notional * (edgeBpsNet / 10000.0),
+				ProfitUSDNet:      primaryNotional * (edgeBpsNet / 10000.0),
 				FeesUSDEst:        feesEst,
 				SlippageUSDEst:    slippageEst,
 				AnnualYieldPctNet: annualizedBasisPct,
@@ -208,12 +235,11 @@ func (e *Engine) Evaluate(accountEquity float64) []TradeIntent {
 			Constraints: IntentConstraints{
 				MaxAgeMs:        e.cfg.IntentTTLMs,
 				HedgePreference: "SEQUENTIAL",
-				CooldownKey:     fmt.Sprintf("basis:%s", sym),
+				CooldownKey:     fmt.Sprintf("basis:%s", pid),
 			},
 		}
 		intents = append(intents, intent)
 
-		// Log stats for debugging (consumed by caller).
 		_ = stats1h
 		_ = stats4h
 	}
@@ -221,9 +247,9 @@ func (e *Engine) Evaluate(accountEquity float64) []TradeIntent {
 	return intents
 }
 
-// evaluateExit checks if an open basis position should be closed.
-func (e *Engine) evaluateExit(sym string, ss *symbolState, currentSpread float64, stats24h rollingStats, now int64) []TradeIntent {
-	pos := ss.position
+// evaluateExit checks if an open cross-pair spread position should be closed.
+func (e *Engine) evaluateExit(ps *pairState, currentSpread float64, stats24h rollingStats, now int64) []TradeIntent {
+	pos := ps.position
 	if pos == nil {
 		return nil
 	}
@@ -231,7 +257,6 @@ func (e *Engine) evaluateExit(sym string, ss *symbolState, currentSpread float64
 	shouldExit := false
 	reason := ""
 
-	// Condition 1: spread has returned within 0.5 stddev of mean.
 	if stats24h.stddev > 0 {
 		deviation := math.Abs(currentSpread-stats24h.mean) / stats24h.stddev
 		if deviation <= e.cfg.ExitStdDev {
@@ -240,7 +265,6 @@ func (e *Engine) evaluateExit(sym string, ss *symbolState, currentSpread float64
 		}
 	}
 
-	// Condition 2: time-based exit after MaxHoldDays.
 	holdMs := now - pos.EntryTime
 	maxHoldMs := int64(e.cfg.MaxHoldDays) * 24 * 60 * 60 * 1000
 	if holdMs >= maxHoldMs {
@@ -252,129 +276,154 @@ func (e *Engine) evaluateExit(sym string, ss *symbolState, currentSpread float64
 		return nil
 	}
 
-	e.seqID++
-	intentID := fmt.Sprintf("basis-exit-%s-%d-%d", sym, now, e.seqID)
+	beta := pos.HedgeBeta
+	if beta <= 0 {
+		beta = 1.0
+	}
+	hedgeNotional := pos.NotionalUSD / beta
 
-	// Reverse of entry: SELL SPOT + BUY PERP.
+	// Reverse of entry.
+	primaryAction := "BUY"
+	hedgeAction := "SELL"
+	if pos.EntrySpread < pos.EntryMean {
+		primaryAction = "SELL"
+		hedgeAction = "BUY"
+	}
+
+	e.seqID++
+	intentID := fmt.Sprintf("basis-exit-%s-%d-%d", pos.PairID, now, e.seqID)
+
 	intent := TradeIntent{
-		IntentID:  intentID,
-		Strategy:  "basis_exit",
-		Symbol:    sym,
-		TsMs:      now,
-		ExpiresMs: now + e.cfg.IntentTTLMs,
+		IntentID:    intentID,
+		Strategy:    "basis_exit",
+		Symbol:      pos.PrimarySymbol,
+		HedgeSymbol: pos.HedgeSymbol,
+		HedgeBeta:   beta,
+		TsMs:        now,
+		ExpiresMs:   now + e.cfg.IntentTTLMs,
 		Legs: []TradeLeg{
 			{
-				Action:         "SELL",
+				Action:         primaryAction,
 				Type:           "LIMIT",
-				Market:         "SPOT",
-				Symbol:         sym,
+				Market:         "PERP",
+				Symbol:         pos.PrimarySymbol,
 				NotionalUSD:    pos.NotionalUSD,
 				MaxSlippageBps: e.cfg.MaxSlippageBps,
 			},
 			{
-				Action:         "BUY",
+				Action:         hedgeAction,
 				Type:           "LIMIT",
 				Market:         "PERP",
-				Symbol:         sym,
-				NotionalUSD:    pos.NotionalUSD,
+				Symbol:         pos.HedgeSymbol,
+				NotionalUSD:    hedgeNotional,
 				MaxSlippageBps: e.cfg.MaxSlippageBps,
 			},
 		},
 		Expected: ExpectedMetrics{
 			EdgeBpsGross: (pos.EntrySpread - currentSpread) * 10000.0,
-			EdgeBpsNet:   0, // to be computed after fees
+			EdgeBpsNet:   0,
 		},
 		Constraints: IntentConstraints{
 			MaxAgeMs:        e.cfg.IntentTTLMs,
 			HedgePreference: "SEQUENTIAL",
-			CooldownKey:     fmt.Sprintf("basis-exit:%s", sym),
+			CooldownKey:     fmt.Sprintf("basis-exit:%s", pos.PairID),
 		},
 	}
 
-	_ = reason // used for logging in production
-
+	_ = reason
 	return []TradeIntent{intent}
 }
 
-// ConfirmEntry records that a basis position has been opened.
-func (e *Engine) ConfirmEntry(sym string, notionalUSD, entrySpread float64) {
+// ConfirmEntry records that a cross-pair spread position has been opened.
+func (e *Engine) ConfirmEntry(primary, hedge string, notionalUSD, beta, entrySpread float64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	now := time.Now().UnixMilli()
-	ss, ok := e.state[sym]
+	pid := primary + ":" + hedge
+	ps, ok := e.state[pid]
 	if !ok {
 		return
 	}
 
-	stats24h := computeRollingStats(ss.samples, now, 24*60*60*1000)
+	stats24h := computeRollingStats(ps.samples, now, 24*60*60*1000)
 
-	ss.position = &basisPosition{
-		Symbol:      sym,
-		NotionalUSD: notionalUSD,
-		EntrySpread: entrySpread,
-		EntryTime:   now,
-		EntryMean:   stats24h.mean,
-		EntryStdDev: stats24h.stddev,
+	ps.position = &basisPosition{
+		PairID:        pid,
+		PrimarySymbol: primary,
+		HedgeSymbol:   hedge,
+		NotionalUSD:   notionalUSD,
+		HedgeBeta:     beta,
+		EntrySpread:   entrySpread,
+		EntryTime:     now,
+		EntryMean:     stats24h.mean,
+		EntryStdDev:   stats24h.stddev,
 	}
-	ss.cooldownMs = now + int64(e.cfg.CooldownS)*1000
+	ps.cooldownMs = now + int64(e.cfg.CooldownS)*1000
 }
 
-// ConfirmExit removes a basis position after it has been closed.
-func (e *Engine) ConfirmExit(sym string) {
+// ConfirmExit removes a cross-pair position after it has been closed.
+func (e *Engine) ConfirmExit(primary, hedge string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	ss, ok := e.state[sym]
+	pid := primary + ":" + hedge
+	ps, ok := e.state[pid]
 	if !ok {
 		return
 	}
-	ss.position = nil
-	ss.cooldownMs = time.Now().UnixMilli() + int64(e.cfg.CooldownS)*1000
+	ps.position = nil
+	ps.cooldownMs = time.Now().UnixMilli() + int64(e.cfg.CooldownS)*1000
 }
 
-// OpenPositions returns a snapshot of all currently open basis positions.
+// OpenPositions returns a snapshot of all currently open spread positions.
 func (e *Engine) OpenPositions() map[string]basisPosition {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	out := make(map[string]basisPosition)
-	for sym, ss := range e.state {
-		if ss.position != nil {
-			out[sym] = *ss.position
+	for pid, ps := range e.state {
+		if ps.position != nil {
+			out[pid] = *ps.position
 		}
 	}
 	return out
 }
 
-// TotalNotional returns the total notional USD across all open basis positions.
+// TotalNotional returns the total notional USD across all open positions
+// (both primary and hedge legs combined).
 func (e *Engine) TotalNotional() float64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	var total float64
-	for _, ss := range e.state {
-		if ss.position != nil {
-			total += ss.position.NotionalUSD
+	for _, ps := range e.state {
+		if ps.position != nil {
+			beta := ps.position.HedgeBeta
+			if beta <= 0 {
+				beta = 1.0
+			}
+			total += ps.position.NotionalUSD + ps.position.NotionalUSD/beta
 		}
 	}
 	return total
 }
 
-// SpreadStats returns rolling spread statistics for a symbol at the
-// 1h, 4h, and 24h windows. Returns zeros if insufficient data.
-func (e *Engine) SpreadStats(symbol string) (stats1h, stats4h, stats24h rollingStats) {
+// SpreadStats returns rolling spread statistics for a pair at the
+// 1h, 4h, and 24h windows.
+func (e *Engine) SpreadStats(primary, hedge string) (stats1h, stats4h, stats24h rollingStats) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	ss, ok := e.state[symbol]
+	pid := primary + ":" + hedge
+	ps, ok := e.state[pid]
 	if !ok {
 		return
 	}
 	now := time.Now().UnixMilli()
-	stats1h = computeRollingStats(ss.samples, now, 1*60*60*1000)
-	stats4h = computeRollingStats(ss.samples, now, 4*60*60*1000)
-	stats24h = computeRollingStats(ss.samples, now, 24*60*60*1000)
+	stats1h = computeRollingStats(ps.samples, now, 1*60*60*1000)
+	stats4h = computeRollingStats(ps.samples, now, 4*60*60*1000)
+	stats24h = computeRollingStats(ps.samples, now, 24*60*60*1000)
 	return
 }
 

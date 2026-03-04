@@ -8,10 +8,17 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// BasisConfig holds all tunables for the intra-exchange basis trading strategy.
+// SpreadPairConfig defines a cross-pair relationship for spread trading.
+type SpreadPairConfig struct {
+	Primary        string  `yaml:"primary"`          // e.g. "BTCUSDT"
+	Hedge          string  `yaml:"hedge"`            // e.g. "ETHUSDT"
+	MinCorrelation float64 `yaml:"min_correlation"`  // e.g. 0.70
+}
+
+// BasisConfig holds all tunables for the cross-pair spread trading strategy.
 type BasisConfig struct {
-	// Symbols to monitor for basis trades, e.g. ["BTCUSDT", "ETHUSDT"].
-	Symbols []string `yaml:"symbols"`
+	// Pairs to monitor for spread trades.
+	Pairs []SpreadPairConfig `yaml:"pairs"`
 
 	// EntryStdDev is the number of standard deviations from the 24h mean
 	// required to enter a basis trade (default 2.0).
@@ -49,7 +56,9 @@ type BasisConfig struct {
 // DefaultBasisConfig returns sensible defaults for HyroTrader challenge.
 func DefaultBasisConfig() BasisConfig {
 	return BasisConfig{
-		Symbols:               []string{"BTCUSDT", "ETHUSDT"},
+		Pairs: []SpreadPairConfig{
+			{Primary: "BTCUSDT", Hedge: "ETHUSDT", MinCorrelation: 0.70},
+		},
 		EntryStdDev:           2.0,
 		ExitStdDev:            0.5,
 		MinAnnualizedBasisPct: 15.0,

@@ -548,34 +548,36 @@ func (d *Daemon) Reset() {
 // two-leg delta-neutral position, ensuring both legs have matching and
 // wide-enough stops.
 type PairedStopLossInfo struct {
-	SpotSymbol    string
-	PerpSymbol    string
-	MinWidthPct   decimal.Decimal // minimum stop distance as % of entry
-	SpotStopPrice decimal.Decimal // suggested spot stop price
-	PerpStopPrice decimal.Decimal // suggested perp stop price
-	Coordinated   bool            // true if both legs are tracked
+	PrimarySymbol    string
+	HedgeSymbol      string
+	MinWidthPct      decimal.Decimal // minimum stop distance as % of entry
+	PrimaryStopPrice decimal.Decimal // suggested primary leg stop price
+	HedgeStopPrice   decimal.Decimal // suggested hedge leg stop price
+	Coordinated      bool            // true if both legs are tracked
 }
 
 // ComputePairedStopLoss calculates coordinated stop-loss levels for a
-// delta-neutral pair. Both legs get the same width (the configured default)
+// cross-pair delta-neutral position. Both legs get the same width percentage
 // to prevent one leg from triggering without the other.
-func (d *Daemon) ComputePairedStopLoss(symbol string, spotEntry, perpEntry decimal.Decimal) PairedStopLossInfo {
+// Primary leg is SHORT: stop above entry. Hedge leg is LONG: stop below entry.
+func (d *Daemon) ComputePairedStopLoss(primarySymbol, hedgeSymbol string, primaryEntry, hedgeEntry decimal.Decimal) PairedStopLossInfo {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	width := d.cfg.StopLossDefaultPct.Div(hundred)
 
-	// For long spot: stop below entry. For short perp: stop above entry.
-	spotStop := spotEntry.Mul(decimal.NewFromInt(1).Sub(width))
-	perpStop := perpEntry.Mul(decimal.NewFromInt(1).Add(width))
+	// Primary (short): stop above entry.
+	primaryStop := primaryEntry.Mul(decimal.NewFromInt(1).Add(width))
+	// Hedge (long): stop below entry.
+	hedgeStop := hedgeEntry.Mul(decimal.NewFromInt(1).Sub(width))
 
 	return PairedStopLossInfo{
-		SpotSymbol:    symbol,
-		PerpSymbol:    symbol,
-		MinWidthPct:   d.cfg.StopLossDefaultPct,
-		SpotStopPrice: spotStop,
-		PerpStopPrice: perpStop,
-		Coordinated:   true,
+		PrimarySymbol:    primarySymbol,
+		HedgeSymbol:      hedgeSymbol,
+		MinWidthPct:      d.cfg.StopLossDefaultPct,
+		PrimaryStopPrice: primaryStop,
+		HedgeStopPrice:   hedgeStop,
+		Coordinated:      true,
 	}
 }
 
@@ -603,19 +605,19 @@ func (d *Daemon) ValidateStopLossWidth(entryPrice, stopPrice decimal.Decimal) er
 	return nil
 }
 
-// ConfirmPairedStopLoss marks both the spot and perp legs as having
+// ConfirmPairedStopLoss marks both the primary and hedge legs as having
 // coordinated stop-losses. This should be called after both stops are
 // successfully placed on the exchange.
-func (d *Daemon) ConfirmPairedStopLoss(spotSymbol, perpSymbol string) {
+func (d *Daemon) ConfirmPairedStopLoss(primarySymbol, hedgeSymbol string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if pos, ok := d.positions[spotSymbol]; ok {
+	if pos, ok := d.positions[primarySymbol]; ok {
 		pos.HasStopLoss = true
 		pos.StopLossSet = time.Now().UTC()
 	}
-	if perpSymbol != spotSymbol {
-		if pos, ok := d.positions[perpSymbol]; ok {
+	if hedgeSymbol != primarySymbol {
+		if pos, ok := d.positions[hedgeSymbol]; ok {
 			pos.HasStopLoss = true
 			pos.StopLossSet = time.Now().UTC()
 		}

@@ -1,5 +1,6 @@
-// Package funding implements a single-exchange funding rate arbitrage engine
-// targeting Bybit perpetual contracts.
+// Package funding implements a cross-pair funding rate arbitrage engine
+// using USDT perpetual contracts on Bybit.
+// Strategy: short the high-funding perp + long the correlated hedge perp.
 package funding
 
 import (
@@ -10,38 +11,43 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// AllocationTier maps a funding rate threshold (in percent, e.g. 0.03)
+// FundingPairConfig defines a cross-pair trading relationship for funding arb.
+type FundingPairConfig struct {
+	Primary        string  `yaml:"primary"`          // e.g. "BTCUSDT"
+	Hedge          string  `yaml:"hedge"`            // e.g. "ETHUSDT"
+	MinCorrelation float64 `yaml:"min_correlation"`  // e.g. 0.70
+}
+
+// AllocationTier maps a funding differential threshold (in bps)
 // to the maximum allocation percentage for that tier.
 type AllocationTier struct {
-	MinRatePct    float64 `yaml:"min_rate_pct"`
-	MaxRatePct    float64 `yaml:"max_rate_pct"`
+	MinDiffBps    float64 `yaml:"min_diff_bps"`
+	MaxDiffBps    float64 `yaml:"max_diff_bps"`
 	AllocationPct float64 `yaml:"allocation_pct"`
 }
 
-// Config holds all tunables for the funding rate arbitrage strategy.
+// Config holds all tunables for the cross-pair funding rate arbitrage strategy.
 type Config struct {
-	// Symbols to monitor, e.g. ["BTCUSDT", "ETHUSDT"].
-	Symbols []string `yaml:"symbols"`
+	// Pairs to monitor for funding rate differential.
+	Pairs []FundingPairConfig `yaml:"pairs"`
 
-	// MinAnnualYieldPct is the minimum annualised yield (%) to enter a position.
+	// MinAnnualYieldPct is the minimum annualised yield (%) from funding
+	// rate differential to enter a position.
 	MinAnnualYieldPct float64 `yaml:"min_annual_yield_pct"`
 
-	// ExitThresholdRate is the funding rate below which we consider exiting.
-	ExitThresholdRate float64 `yaml:"exit_threshold_rate"`
+	// ExitThresholdDiffBps is the funding rate differential (bps) below
+	// which we consider exiting.
+	ExitThresholdDiffBps float64 `yaml:"exit_threshold_diff_bps"`
 
-	// NegativeExitCycles: exit after N consecutive cycles with rate < ExitThresholdRate.
+	// NegativeExitCycles: exit after N consecutive cycles with diff < threshold.
 	NegativeExitCycles int `yaml:"negative_exit_cycles"`
 
 	// MaxAllocationPct is the maximum percentage of account equity allocated
 	// to the funding strategy overall.
 	MaxAllocationPct float64 `yaml:"max_allocation_pct"`
 
-	// AllocationByRate determines position sizing based on the predicted
-	// funding rate magnitude.
-	//   rate > 0.03%  -> 60%
-	//   0.01%-0.03%   -> 40%
-	//   rate < 0.01%  -> 20%
-	AllocationByRate []AllocationTier `yaml:"allocation_by_rate"`
+	// AllocationByDiff determines position sizing based on funding differential.
+	AllocationByDiff []AllocationTier `yaml:"allocation_by_diff"`
 
 	// FeeBpsTaker is the taker fee on Bybit in basis points (default 5.5).
 	FeeBpsTaker float64 `yaml:"fee_bps_taker"`
@@ -55,36 +61,30 @@ type Config struct {
 	// MaxSlippageBps is the maximum allowed slippage in basis points.
 	MaxSlippageBps float64 `yaml:"max_slippage_bps"`
 
-	// CooldownS is the minimum seconds between trades on the same symbol.
+	// CooldownS is the minimum seconds between trades on the same pair.
 	CooldownS int `yaml:"cooldown_s"`
-
-	// SymbolWeights maps symbol -> weight for allocation splitting.
-	// e.g. {"BTCUSDT": 0.60, "ETHUSDT": 0.40}
-	SymbolWeights map[string]float64 `yaml:"symbol_weights"`
 }
 
 // DefaultConfig returns a Config with sensible defaults for HyroTrader challenge.
 func DefaultConfig() Config {
 	return Config{
-		Symbols:           []string{"BTCUSDT", "ETHUSDT"},
-		MinAnnualYieldPct: 10.0,
-		ExitThresholdRate: 0.0001,
-		NegativeExitCycles: 3,
-		MaxAllocationPct:  60.0,
-		AllocationByRate: []AllocationTier{
-			{MinRatePct: 0.03, MaxRatePct: 100.0, AllocationPct: 60.0},
-			{MinRatePct: 0.01, MaxRatePct: 0.03, AllocationPct: 40.0},
-			{MinRatePct: 0.0, MaxRatePct: 0.01, AllocationPct: 20.0},
+		Pairs: []FundingPairConfig{
+			{Primary: "BTCUSDT", Hedge: "ETHUSDT", MinCorrelation: 0.70},
+		},
+		MinAnnualYieldPct:    10.0,
+		ExitThresholdDiffBps: 0.5,
+		NegativeExitCycles:   3,
+		MaxAllocationPct:     60.0,
+		AllocationByDiff: []AllocationTier{
+			{MinDiffBps: 30.0, MaxDiffBps: 10000.0, AllocationPct: 60.0},
+			{MinDiffBps: 10.0, MaxDiffBps: 30.0, AllocationPct: 40.0},
+			{MinDiffBps: 0.0, MaxDiffBps: 10.0, AllocationPct: 20.0},
 		},
 		FeeBpsTaker:    5.5,
 		EvalIntervalS:  30,
 		IntentTTLMs:    10000,
 		MaxSlippageBps: 5.0,
 		CooldownS:      300,
-		SymbolWeights: map[string]float64{
-			"BTCUSDT": 0.60,
-			"ETHUSDT": 0.40,
-		},
 	}
 }
 
@@ -107,9 +107,9 @@ func LoadConfig(path string) (Config, error) {
 			cfg.MinAnnualYieldPct = f
 		}
 	}
-	if v := os.Getenv("FUNDING_EXIT_THRESHOLD_RATE"); v != "" {
+	if v := os.Getenv("FUNDING_EXIT_THRESHOLD_DIFF_BPS"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			cfg.ExitThresholdRate = f
+			cfg.ExitThresholdDiffBps = f
 		}
 	}
 	if v := os.Getenv("FUNDING_MAX_ALLOCATION_PCT"); v != "" {
@@ -151,17 +151,16 @@ func LoadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
-// AllocationPctForRate returns the allocation percentage for a given
-// funding rate (expressed as a percentage, e.g. 0.03 for 0.03%).
-func (c *Config) AllocationPctForRate(ratePct float64) float64 {
-	for _, tier := range c.AllocationByRate {
-		if ratePct >= tier.MinRatePct && ratePct < tier.MaxRatePct {
+// AllocationPctForDiff returns the allocation percentage for a given
+// funding rate differential (in bps).
+func (c *Config) AllocationPctForDiff(diffBps float64) float64 {
+	for _, tier := range c.AllocationByDiff {
+		if diffBps >= tier.MinDiffBps && diffBps < tier.MaxDiffBps {
 			return tier.AllocationPct
 		}
 	}
-	// Fallback: if rate > highest tier, use the highest allocation.
-	if len(c.AllocationByRate) > 0 && ratePct >= c.AllocationByRate[0].MinRatePct {
-		return c.AllocationByRate[0].AllocationPct
+	if len(c.AllocationByDiff) > 0 && diffBps >= c.AllocationByDiff[0].MinDiffBps {
+		return c.AllocationByDiff[0].AllocationPct
 	}
 	return 20.0
 }

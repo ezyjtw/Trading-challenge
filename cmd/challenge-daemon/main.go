@@ -124,17 +124,22 @@ func main() {
 
 				// Publish paired stop-loss info for execution router
 				if len(intent.Legs) >= 2 {
-					spotEntry := decimal.NewFromFloat(intent.Legs[0].NotionalUSD)
-					perpEntry := decimal.NewFromFloat(intent.Legs[1].NotionalUSD)
-					slInfo := daemon.ComputePairedStopLoss(intent.Symbol, spotEntry, perpEntry)
+					primaryEntry := decimal.NewFromFloat(intent.Legs[0].NotionalUSD)
+					hedgeEntry := decimal.NewFromFloat(intent.Legs[1].NotionalUSD)
+					hedgeSymbol := intent.HedgeSymbol
+					if hedgeSymbol == "" && len(intent.Legs) >= 2 {
+						hedgeSymbol = intent.Legs[1].Symbol
+					}
+					slInfo := daemon.ComputePairedStopLoss(intent.Symbol, hedgeSymbol, primaryEntry, hedgeEntry)
 					bus.Publish(ctx, eventbus.StreamChallenge, map[string]interface{}{
-						"type":          "PAIRED_STOP_LOSS",
-						"intent":        intent.IntentID,
-						"symbol":        intent.Symbol,
-						"min_width_pct": slInfo.MinWidthPct.StringFixed(2),
-						"spot_stop":     slInfo.SpotStopPrice.StringFixed(2),
-						"perp_stop":     slInfo.PerpStopPrice.StringFixed(2),
-						"ts_ms":         time.Now().UnixMilli(),
+						"type":           "PAIRED_STOP_LOSS",
+						"intent":         intent.IntentID,
+						"primary":        intent.Symbol,
+						"hedge":          hedgeSymbol,
+						"min_width_pct":  slInfo.MinWidthPct.StringFixed(2),
+						"primary_stop":   slInfo.PrimaryStopPrice.StringFixed(2),
+						"hedge_stop":     slInfo.HedgeStopPrice.StringFixed(2),
+						"ts_ms":          time.Now().UnixMilli(),
 					})
 				}
 
@@ -173,20 +178,33 @@ func main() {
 		case <-safetyTicker.C:
 			if daemon.CheckSafetyTrade() {
 				slog.Info("challenge-daemon: safety trade needed — no trades today")
+				// Safety trade: minimal delta-neutral pair trade on USDT perps.
 				safetyIntent := arb.TradeIntent{
-					IntentID:  "safety-" + time.Now().Format("20060102-150405"),
-					Strategy:  "SAFETY_TRADE",
-					Symbol:    "BTCUSDT",
-					TsMs:      time.Now().UnixMilli(),
-					ExpiresMs: time.Now().Add(5 * time.Minute).UnixMilli(),
-					Legs: []arb.TradeLeg{{
-						Action:         "BUY",
-						Type:           "MARKET",
-						Market:         "SPOT",
-						Symbol:         "BTCUSDT",
-						NotionalUSD:    100,
-						MaxSlippageBps: 10,
-					}},
+					IntentID:    "safety-" + time.Now().Format("20060102-150405"),
+					Strategy:    "SAFETY_TRADE",
+					Symbol:      "BTCUSDT",
+					HedgeSymbol: "ETHUSDT",
+					HedgeBeta:   1.0,
+					TsMs:        time.Now().UnixMilli(),
+					ExpiresMs:   time.Now().Add(5 * time.Minute).UnixMilli(),
+					Legs: []arb.TradeLeg{
+						{
+							Action:         "SELL",
+							Type:           "MARKET",
+							Market:         "PERP",
+							Symbol:         "BTCUSDT",
+							NotionalUSD:    100,
+							MaxSlippageBps: 10,
+						},
+						{
+							Action:         "BUY",
+							Type:           "MARKET",
+							Market:         "PERP",
+							Symbol:         "ETHUSDT",
+							NotionalUSD:    100,
+							MaxSlippageBps: 10,
+						},
+					},
 				}
 				bus.Publish(ctx, eventbus.StreamApproved, safetyIntent)
 				alerter.Send(ctx, alerting.Alert{

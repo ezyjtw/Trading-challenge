@@ -119,8 +119,9 @@ func (d *Daemon) Tick() []Alert {
 }
 
 // RecordPositionSnapshot records exchange positions for leg-mismatch detection.
-// Positions are expected to come in pairs for hedged strategies; an unhedged
-// leg triggers alerts and eventually mode escalation.
+// For cross-pair delta-neutral strategies, positions are on different symbols
+// but hedged via beta weighting. We detect mismatch by checking if total net
+// dollar exposure exceeds a threshold (rather than per-symbol zero-net check).
 func (d *Daemon) RecordPositionSnapshot(positions []PositionSnapshot) []Alert {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -129,23 +130,26 @@ func (d *Daemon) RecordPositionSnapshot(positions []PositionSnapshot) []Alert {
 	d.lastPositionSnap = positions
 	d.lastSnapTsMs = now
 
-	// Check for unhedged legs: sum net notional across all symbols.
-	netBySymbol := make(map[string]decimal.Decimal)
+	// For cross-pair strategies, positions are on different symbols but hedged.
+	// Sum net dollar exposure across all positions:
+	// long = positive, short = negative.
+	netDollarExposure := decimal.Zero
 	for _, p := range positions {
-		qty := p.Size
+		notional := p.Size
 		if p.Side == "Sell" {
-			qty = qty.Neg()
+			notional = notional.Neg()
 		}
-		netBySymbol[p.Symbol] = netBySymbol[p.Symbol].Add(qty)
+		netDollarExposure = netDollarExposure.Add(notional)
 	}
 
-	hasUnhedged := false
-	for _, net := range netBySymbol {
-		if !net.IsZero() {
-			hasUnhedged = true
-			break
-		}
+	// Allow small imbalance (up to 5% of total size) for beta weighting imprecision.
+	totalSize := decimal.Zero
+	for _, p := range positions {
+		totalSize = totalSize.Add(p.Size)
 	}
+
+	threshold := totalSize.Mul(decimal.NewFromFloat(0.05))
+	hasUnhedged := netDollarExposure.Abs().GreaterThan(threshold) && totalSize.IsPositive()
 
 	var alerts []Alert
 
@@ -157,13 +161,13 @@ func (d *Daemon) RecordPositionSnapshot(positions []PositionSnapshot) []Alert {
 
 		if durationMs >= d.cfg.LegMismatchCloseMs {
 			alerts = append(alerts, d.escalateTo(ModeFlatten, now,
-				"unhedged leg exceeded close threshold"))
+				"unhedged exposure exceeded close threshold"))
 		} else if durationMs >= d.cfg.LegMismatchAlertMs {
 			alerts = append(alerts, Alert{
 				TsMs:      now,
 				Source:    "risk.daemon",
 				Severity:  SeverityWarn,
-				Message:   "unhedged leg detected",
+				Message:   "unhedged exposure detected",
 				Metric:    "leg_mismatch_duration_ms",
 				Value:     float64(durationMs),
 				Threshold: float64(d.cfg.LegMismatchAlertMs),

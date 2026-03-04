@@ -1,6 +1,7 @@
 // Strategy engine: autonomous delta-neutral strategy orchestrator.
-// Evaluates market conditions each cycle, selects the best strategy
-// (funding carry, basis reversion, or hold), and generates trade intents.
+// Evaluates cross-pair market conditions each cycle, selects the best strategy
+// (funding carry, spread mean-reversion, or hold), and generates trade intents.
+// All trades use USDT perpetual futures only (no spot).
 // Listens to execution events to confirm entries/exits and maintain state.
 package main
 
@@ -23,6 +24,12 @@ import (
 	"github.com/ezyjtw/Trading-challenge/internal/marketdata"
 	"github.com/ezyjtw/Trading-challenge/internal/strategy"
 )
+
+// pairDef defines a cross-pair trading relationship.
+type pairDef struct {
+	Primary string
+	Hedge   string
+}
 
 func main() {
 	slog.Info("strategy-engine: starting")
@@ -48,11 +55,15 @@ func main() {
 		}
 	}
 
-	symbols := []string{"BTCUSDT", "ETHUSDT"}
+	// Configured cross-pair relationships.
+	pairs := []pairDef{
+		{Primary: "BTCUSDT", Hedge: "ETHUSDT"},
+	}
 
 	// --- Core components ---
 	selector := strategy.NewSelector(strategy.DefaultSelectorConfig())
 	basisTracker := strategy.NewBasisTracker(strategy.DefaultBasisConfig())
+	corrTracker := strategy.NewCorrelationTracker(500) // 500-sample rolling window
 	regime := funding.NewRegimeDetector(funding.RegimeConfig{
 		LookbackPeriods:           90,
 		NegativeThresholdPct:      60.0,
@@ -103,14 +114,28 @@ func main() {
 				cp := q
 				latestQuotes[q.Symbol] = &cp
 
-				// Feed basis tracker.
+				// Feed basis tracker (single-symbol perp premium).
 				if q.IndexPrice > 0 && q.MarkPrice > 0 {
-					basisTracker.Record(q.Symbol, q.IndexPrice, q.MarkPrice, q.TsMs)
+					basisTracker.RecordPremium(q.Symbol, q.IndexPrice, q.MarkPrice, q.TsMs)
 				}
 
 				// Feed regime detector.
 				if q.FundingRate != 0 {
 					regime.RecordRate(q.Symbol, q.FundingRate, q.TsMs)
+				}
+			}
+
+			// Update cross-pair trackers with latest prices.
+			for _, pair := range pairs {
+				pq, pOk := latestQuotes[pair.Primary]
+				hq, hOk := latestQuotes[pair.Hedge]
+				if pOk && hOk {
+					ts := pq.TsMs
+					if hq.TsMs > ts {
+						ts = hq.TsMs
+					}
+					corrTracker.RecordPrices(pair.Primary, pair.Hedge, pq.MarkPrice, hq.MarkPrice, ts)
+					basisTracker.RecordPairSpread(pair.Primary, pair.Hedge, pq.MarkPrice, hq.MarkPrice, ts)
 				}
 			}
 			quotesMu.Unlock()
@@ -122,52 +147,78 @@ func main() {
 				continue
 			}
 			for _, raw := range msgs {
-				// Try to parse as FillSummary (successful two-leg fill).
 				var fill execution.FillSummary
 				if err := json.Unmarshal(raw, &fill); err != nil || fill.IntentID == "" {
 					continue
 				}
 
-				// Determine if this is an entry or exit fill.
 				strat := fill.Strategy
 				sym := fill.Symbol
 				if strat == "" || sym == "" {
 					continue
 				}
 
-				quotesMu.Lock()
-				q := latestQuotes[sym]
-				quotesMu.Unlock()
+				// Determine hedge symbol from the fill or intent.
+				hedgeSym := fill.HedgeSymbol
+				if hedgeSym == "" {
+					// Fallback: infer from configured pairs.
+					for _, pair := range pairs {
+						if pair.Primary == sym {
+							hedgeSym = pair.Hedge
+							break
+						}
+					}
+				}
 
 				if strings.HasSuffix(strat, "_exit") {
-					selector.ConfirmExit(sym)
+					selector.ConfirmExit(sym, hedgeSym)
 					slog.Info("strategy: position closed",
-						"symbol", sym, "strategy", strat, "intent", fill.IntentID)
+						"primary", sym, "hedge", hedgeSym,
+						"strategy", strat, "intent", fill.IntentID)
 					alerter.Send(ctx, alerting.Alert{
 						Level: "INFO", Source: "strategy-engine",
-						Message: fmt.Sprintf("Position closed: %s via %s (PnL: %.2f)", sym, strat, fill.NetPnL),
+						Message: fmt.Sprintf("Position closed: %s/%s via %s (PnL: %.2f)", sym, hedgeSym, strat, fill.NetPnL),
 					})
 				} else {
-					// Build condition for ConfirmEntry.
-					var cond strategy.MarketCondition
-					if q != nil {
-						cond = basisTracker.Condition(sym, q.IndexPrice, q.MarkPrice, q.FundingRate,
-							string(regime.DetectRegime(sym)), q.TsMs)
+					// Build PairCondition for ConfirmEntry.
+					quotesMu.Lock()
+					pq := latestQuotes[sym]
+					hq := latestQuotes[hedgeSym]
+					quotesMu.Unlock()
+
+					var cond strategy.PairCondition
+					cond.PrimarySymbol = sym
+					cond.HedgeSymbol = hedgeSym
+					if pq != nil {
+						cond.PrimaryPrice = pq.MarkPrice
+						cond.PrimaryFunding = pq.FundingRate
 					}
+					if hq != nil {
+						cond.HedgePrice = hq.MarkPrice
+						cond.HedgeFunding = hq.FundingRate
+					}
+					if pq != nil && hq != nil {
+						cond.FundingDiffBps = (pq.FundingRate - hq.FundingRate) * 10000.0
+					}
+					cond.Beta = corrTracker.Beta(sym, hedgeSym)
+					cond.Correlation = corrTracker.Correlation(sym, hedgeSym)
+					cond.SpreadZScore = basisTracker.PairSpreadZScore(sym, hedgeSym)
+					cond.Regime = string(regime.DetectRegime(sym))
 
 					stratType := strategy.StrategyFundingCarry
 					if strat == "basis" {
 						stratType = strategy.StrategyBasisReversion
 					}
 
-					notional := fill.BuyPrice // approximate
+					notional := fill.BuyPrice
 					if fill.TotalFees > 0 {
 						notional = (fill.BuyPrice + fill.SellPrice) / 2
 					}
 
-					selector.ConfirmEntry(sym, stratType, notional, cond)
+					selector.ConfirmEntry(sym, hedgeSym, stratType, notional, cond)
 					slog.Info("strategy: position confirmed",
-						"symbol", sym, "strategy", strat, "intent", fill.IntentID)
+						"primary", sym, "hedge", hedgeSym,
+						"strategy", strat, "intent", fill.IntentID)
 				}
 			}
 
@@ -180,21 +231,39 @@ func main() {
 				continue
 			}
 
-			// Build market conditions for all symbols.
+			// Build cross-pair conditions.
 			quotesMu.Lock()
-			var conditions []strategy.MarketCondition
-			for _, sym := range symbols {
-				q, ok := latestQuotes[sym]
-				if !ok {
+			var pairConditions []strategy.PairCondition
+			for _, pair := range pairs {
+				pq, pOk := latestQuotes[pair.Primary]
+				hq, hOk := latestQuotes[pair.Hedge]
+				if !pOk || !hOk {
 					continue
 				}
-				regimeStr := string(regime.DetectRegime(sym))
-				cond := basisTracker.Condition(sym, q.IndexPrice, q.MarkPrice, q.FundingRate, regimeStr, q.TsMs)
-				conditions = append(conditions, cond)
+
+				cond := strategy.PairCondition{
+					PrimarySymbol:  pair.Primary,
+					PrimaryPrice:   pq.MarkPrice,
+					PrimaryFunding: pq.FundingRate,
+					HedgeSymbol:    pair.Hedge,
+					HedgePrice:     hq.MarkPrice,
+					HedgeFunding:   hq.FundingRate,
+					FundingDiffBps: (pq.FundingRate - hq.FundingRate) * 10000.0,
+					Beta:           corrTracker.Beta(pair.Primary, pair.Hedge),
+					Correlation:    corrTracker.Correlation(pair.Primary, pair.Hedge),
+					SpreadZScore:   basisTracker.PairSpreadZScore(pair.Primary, pair.Hedge),
+					Regime:         string(regime.DetectRegime(pair.Primary)),
+					TsMs:           pq.TsMs,
+				}
+				spreadMean, spreadStdDev, _ := basisTracker.PairSpreadStats(pair.Primary, pair.Hedge)
+				cond.SpreadMean = spreadMean
+				cond.SpreadStdDev = spreadStdDev
+
+				pairConditions = append(pairConditions, cond)
 			}
 			quotesMu.Unlock()
 
-			if len(conditions) == 0 {
+			if len(pairConditions) == 0 {
 				continue
 			}
 
@@ -207,22 +276,25 @@ func main() {
 				}
 			}
 
-			// Calculate regime scale factor (min across all symbols).
+			// Calculate regime scale factor.
 			minScale := 1.0
-			for _, sym := range symbols {
-				scale := regime.PositionScaleFactor(sym)
-				if scale < minScale {
-					minScale = scale
+			for _, pair := range pairs {
+				for _, sym := range []string{pair.Primary, pair.Hedge} {
+					scale := regime.PositionScaleFactor(sym)
+					if scale < minScale {
+						minScale = scale
+					}
 				}
 			}
 
 			// Run the strategy selector.
-			eval := selector.Evaluate(conditions, accountEquity, minScale)
+			eval := selector.Evaluate(pairConditions, accountEquity, minScale)
 
 			// Log decisions.
 			for _, d := range eval.Decisions {
 				slog.Info("strategy decision",
-					"symbol", d.Symbol,
+					"primary", d.PrimarySymbol,
+					"hedge", d.HedgeSymbol,
 					"strategy", d.Strategy,
 					"confidence", fmt.Sprintf("%.2f", d.Confidence),
 					"reason", d.Reason,
@@ -240,7 +312,8 @@ func main() {
 				}
 				exitsPublished++
 				slog.Info("strategy: exit intent emitted",
-					"id", intent.IntentID, "symbol", intent.Symbol,
+					"id", intent.IntentID, "primary", intent.Symbol,
+					"hedge", intent.HedgeSymbol,
 					"strategy", intent.Strategy, "regime_scale", minScale)
 			}
 
@@ -255,13 +328,14 @@ func main() {
 				}
 				entriesPublished++
 				slog.Info("strategy: entry intent emitted",
-					"id", intent.IntentID, "symbol", intent.Symbol,
+					"id", intent.IntentID, "primary", intent.Symbol,
+					"hedge", intent.HedgeSymbol,
 					"strategy", intent.Strategy,
 					"regime_scale", minScale)
 
 				alerter.Send(ctx, alerting.Alert{
 					Level: "INFO", Source: "strategy-engine",
-					Message: fmt.Sprintf("New %s intent: %s %s", intent.Strategy, intent.Symbol, intent.IntentID),
+					Message: fmt.Sprintf("New %s intent: %s/%s %s", intent.Strategy, intent.Symbol, intent.HedgeSymbol, intent.IntentID),
 				})
 			}
 

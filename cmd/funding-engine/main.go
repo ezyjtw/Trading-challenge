@@ -1,4 +1,5 @@
-// Funding engine service: monitors funding rates, generates delta-neutral trade intents.
+// Funding engine service: monitors cross-pair funding rate differentials,
+// generates delta-neutral trade intents using USDT perpetual futures only.
 // Wires in: RegimeDetector for proactive position scaling in negative-rate environments.
 package main
 
@@ -37,16 +38,18 @@ func main() {
 	}
 
 	cfg := funding.Config{
-		Symbols:            []string{"BTCUSDT", "ETHUSDT"},
-		MinAnnualYieldPct:  5.0,
-		ExitThresholdRate:  0.00005,
-		NegativeExitCycles: 2,
-		MaxAllocationPct:   60.0,
-		FeeBpsTaker:        5.5,
-		EvalIntervalS:      30,
-		IntentTTLMs:        10000,
-		MaxSlippageBps:     5.0,
-		CooldownS:          300,
+		Pairs: []funding.FundingPairConfig{
+			{Primary: "BTCUSDT", Hedge: "ETHUSDT", MinCorrelation: 0.70},
+		},
+		MinAnnualYieldPct:    5.0,
+		ExitThresholdDiffBps: 0.5,
+		NegativeExitCycles:   2,
+		MaxAllocationPct:     60.0,
+		FeeBpsTaker:          5.5,
+		EvalIntervalS:        30,
+		IntentTTLMs:          10000,
+		MaxSlippageBps:       5.0,
+		CooldownS:            300,
 	}
 
 	engine := funding.NewEngine(cfg)
@@ -89,7 +92,6 @@ func main() {
 				}
 				fq := funding.Quote{
 					Symbol:      q.Symbol,
-					SpotPrice:   q.IndexPrice,
 					PerpPrice:   q.MarkPrice,
 					FundingRate: q.FundingRate,
 					TsMs:        q.TsMs,
@@ -112,28 +114,30 @@ func main() {
 			}
 
 			// --- Regime-adjusted evaluation ---
-			for _, sym := range cfg.Symbols {
-				// Check if regime says to exit all for this symbol
-				if regime.ShouldExitAll(sym) {
-					slog.Warn("regime: persistent negative — forcing exits", "symbol", sym)
-					exits := engine.EvaluateExits()
-					for _, intent := range exits {
-						if intent.Symbol == sym {
-							bus.Publish(ctx, eventbus.StreamTradeIntents, intent)
-							slog.Info("regime-forced exit", "id", intent.IntentID, "symbol", sym)
+			// Check if regime says to exit all for any symbol in configured pairs.
+			for _, pair := range cfg.Pairs {
+				for _, sym := range []string{pair.Primary, pair.Hedge} {
+					if regime.ShouldExitAll(sym) {
+						slog.Warn("regime: persistent negative — forcing exits", "symbol", sym)
+						exits := engine.EvaluateExits()
+						for _, intent := range exits {
+							if intent.Symbol == sym || intent.HedgeSymbol == sym {
+								bus.Publish(ctx, eventbus.StreamTradeIntents, intent)
+								slog.Info("regime-forced exit", "id", intent.IntentID, "symbol", sym)
+							}
 						}
 					}
-					continue
 				}
 			}
 
 			// Scale account equity by worst regime factor across symbols.
-			// This reduces position sizing in bearish environments.
 			minScale := 1.0
-			for _, sym := range cfg.Symbols {
-				scale := regime.PositionScaleFactor(sym)
-				if scale < minScale {
-					minScale = scale
+			for _, pair := range cfg.Pairs {
+				for _, sym := range []string{pair.Primary, pair.Hedge} {
+					scale := regime.PositionScaleFactor(sym)
+					if scale < minScale {
+						minScale = scale
+					}
 				}
 			}
 			scaledEquity := accountEquity * minScale
@@ -154,6 +158,7 @@ func main() {
 				slog.Info("funding intent emitted",
 					"id", intent.IntentID,
 					"symbol", intent.Symbol,
+					"hedge", intent.HedgeSymbol,
 					"strategy", intent.Strategy,
 					"regime_scale", minScale)
 			}
@@ -166,7 +171,8 @@ func main() {
 				}
 				slog.Info("funding exit emitted",
 					"id", intent.IntentID,
-					"symbol", intent.Symbol)
+					"symbol", intent.Symbol,
+					"hedge", intent.HedgeSymbol)
 			}
 
 		case <-sig:
